@@ -21,9 +21,15 @@ from generate.lodes_combs import LodesComb
 from generate.process_inrix import process_inrix
 from generate.safegraph_combs import SgCombs
 from generate.union_lodes_sg import union
-from generate.generate_routing_df import get_routed, perform_mean_speed_shift
+from generate.generate_routing_df import (
+    get_routed,
+    perform_mean_speed_shift,
+    mean_speed_shift_is_uniform,
+    rescale_routing_df,
+)
 from generate.calibrate_ilp import calibrate_with_ilp
 from generate.utils import *
+from generate.utils import calculate_speed_shift  # explicit: used by the MSSR shortcut
 
 from generate.logger import Logger
 
@@ -591,24 +597,36 @@ if begin:
                     logger.info("Generating post mssr routing df")
                     routing_df = pd.read_parquet(routing_df_output_path)
 
-                    # performing mean speed shift and generating new graphs
-                    if not os.path.exists(adjusted_graphs_path):
-                        hourly_graphs_adjusted = perform_mean_speed_shift(
-                            routing_df=routing_df, travel_time_to_work_by_geoid=travel_time_to_work_df,
-                            hourly_graphs=hourly_graphs,
+                    # performing mean speed shift
+                    if mean_speed_shift_is_uniform(hourly_graphs):
+                        # Every edge is scaled by the same factor, so the shortest
+                        # paths are unchanged: rescale the routed frame instead of
+                        # routing the whole county a second time.
+                        psi = calculate_speed_shift(routing_df, travel_time_to_work_df)
+                        logger.info(
+                            f"Uniform mean speed shift (psi={psi:.4f}); rescaling "
+                            "routed trips instead of re-routing"
                         )
-                        with open(adjusted_graphs_path, 'w') as f:
-                            json.dump(serialize_graphs(hourly_graphs_adjusted), f)
-                        logger.info(f"Adjusted graphs saved to {adjusted_graphs_path}")
+                        post_mssr_routing_df = rescale_routing_df(routing_df, psi)
                     else:
-                        with open(adjusted_graphs_path, 'r') as f:
-                            hourly_graphs_adjusted = deserialize_graphs(json.load(f))
-                        logger.info(f"Adjusted graphs loaded from {adjusted_graphs_path}")
+                        # INRIX edges keep measured speeds, so routes can change.
+                        if not os.path.exists(adjusted_graphs_path):
+                            hourly_graphs_adjusted = perform_mean_speed_shift(
+                                routing_df=routing_df, travel_time_to_work_by_geoid=travel_time_to_work_df,
+                                hourly_graphs=hourly_graphs,
+                            )
+                            with open(adjusted_graphs_path, 'w') as f:
+                                json.dump(serialize_graphs(hourly_graphs_adjusted), f)
+                            logger.info(f"Adjusted graphs saved to {adjusted_graphs_path}")
+                        else:
+                            with open(adjusted_graphs_path, 'r') as f:
+                                hourly_graphs_adjusted = deserialize_graphs(json.load(f))
+                            logger.info(f"Adjusted graphs loaded from {adjusted_graphs_path}")
 
-                    # getting routed trips and travel times post mssr
-                    post_mssr_routing_df = get_routed(
-                        od_df=lodes_output_df, desired_date=start_date, hourly_graphs_arg=hourly_graphs_adjusted
-                    )
+                        # getting routed trips and travel times post mssr
+                        post_mssr_routing_df = get_routed(
+                            od_df=lodes_output_df, desired_date=start_date, hourly_graphs_arg=hourly_graphs_adjusted
+                        )
                     post_mssr_routing_df.to_parquet(post_mssr_routing_df_output_path)
                 
                 else:

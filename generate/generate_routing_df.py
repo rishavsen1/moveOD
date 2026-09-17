@@ -77,6 +77,9 @@ def get_census_time_bin_index(minutes_of_day):
 # unpickles it (measured ~5.7x on a county-sized graph).
 _GRAPH_RSS_PER_PICKLED_BYTE = 6.0
 
+# Aim for this many routing chunks per worker so a slow chunk cannot stall a core.
+CHUNKS_PER_WORKER = 4
+
 
 def _safe_routing_workers(hourly_graphs, n_workers_requested):
     """Throttle routing workers so the per-worker graph copies fit in RAM.
@@ -241,8 +244,10 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
     n_workers = max(1, n_workers)
     if parallel:
         n_workers = _safe_routing_workers(hourly_graphs, n_workers)
-    # Target: ~equal-sized chunks across all workers
-    target_chunk = max(50, math.ceil(n_pairs / n_workers))
+    # Target several chunks per worker, not one: hourly buckets are very uneven
+    # (rush hour dominates), so one chunk per worker leaves most of them idle
+    # waiting on the largest bucket.
+    target_chunk = max(50, math.ceil(n_pairs / (n_workers * CHUNKS_PER_WORKER)))
 
     chunks = []
     for hour_key, tasks in hour_buckets.items():
@@ -293,6 +298,38 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
         print(f"Unique destination CBGs: {routing_df['destination_geoid'].nunique()}")
 
     return routing_df
+
+
+def mean_speed_shift_is_uniform(hourly_graphs):
+    """True when no edge keeps a measured INRIX speed.
+
+    apply_mssr_to_existing_graphs only rescales edges without INRIX data. When
+    there are none, every edge is scaled by the same factor.
+    """
+    distinct = {id(G): G for G in hourly_graphs.values()}
+    for G in distinct.values():
+        for _, _, data in G.edges(data=True):
+            if data.get("inrix_speed", False):
+                return False
+    return True
+
+
+def rescale_routing_df(routing_df, psi):
+    """Apply a *uniform* mean speed shift to an already-routed frame.
+
+    Scaling every road speed by psi divides each edge travel time by psi. A
+    uniform scaling does not change which path is shortest, so the routes -- and
+    therefore travel_distance_mi -- are unchanged and the travel times can be
+    rescaled directly. This makes the second routing pass redundant whenever
+    mean_speed_shift_is_uniform() holds.
+    """
+    out = routing_df.copy()
+    out["travel_time_min"] = out["travel_time_min"] / psi
+    out["arrival_time"] = out["departure_time"] + pd.to_timedelta(
+        out["travel_time_min"] * 60.0, unit="s"
+    )
+    out["travel_time_bin"] = out["travel_time_min"].map(get_travel_time_bin)
+    return out
 
 
 def perform_mean_speed_shift(routing_df, travel_time_to_work_by_geoid, hourly_graphs):
