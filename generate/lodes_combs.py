@@ -597,7 +597,8 @@ class LodesComb:
             #     self.logger.warning(f"Warning: Not all ODs were assigned. {len(result_df)} ODs remain unassigned.")
 
             results.append((day, assigned_od))
-            self.logger.info(f"Saved results for day {day}")
+            # Nothing is written here -- the frame is returned to the caller.
+            self.logger.info(f"Processed day {day}")
 
         try:
             save_building_dictionaries(origin_buildings, dest_buildings, self.output_path)

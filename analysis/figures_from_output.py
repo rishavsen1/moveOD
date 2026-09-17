@@ -31,12 +31,41 @@ def find_calibrated_csv(run_dir: Path) -> Path:
     return candidates[-1]
 
 
-def find_initial_csv(run_dir: Path) -> Path | None:
+def find_initial_frame(run_dir: Path) -> Path | None:
+    """Locate the pre-calibration ("Initial") assignment.
+
+    The live pipeline writes the initial routed trips to
+    intermediate/<day>/post_mssr_routing_df.parquet -- that is the dataset the
+    ILP calibrates, so it is what Figure 2's "Initial" series should show. Falls
+    back to the pre-speed-shift routing frame, then to the older
+    lodes_combs/lodes_<day>.csv layout.
+    """
+    for pattern in ("intermediate/*/post_mssr_routing_df.parquet",
+                    "intermediate/*/routing_df.parquet"):
+        candidates = sorted(run_dir.glob(pattern))
+        if candidates:
+            return candidates[-1]
+
     lodes_dir = run_dir / "lodes_combs"
-    if not lodes_dir.exists():
-        return None
-    candidates = sorted(lodes_dir.glob("lodes_*.csv"))
-    return candidates[-1] if candidates else None
+    if lodes_dir.exists():
+        candidates = sorted(lodes_dir.glob("lodes_*.csv"))
+        if candidates:
+            return candidates[-1]
+    return None
+
+
+def read_table(path: Path) -> pd.DataFrame:
+    """Read a .parquet or .csv table based on its suffix."""
+    return pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+
+
+def find_census_table(census_dir: Path, stem: str) -> Path | None:
+    """Census tables are written as .parquet; older runs wrote .csv."""
+    for suffix in (".parquet", ".csv"):
+        candidate = census_dir / f"{stem}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def pick_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -379,25 +408,23 @@ def main() -> None:
     output_root = Path(args.output_root)
     run_dir = find_run_dir(output_root, args.state, args.county, args.run_id)
     calib_csv = find_calibrated_csv(run_dir)
-    init_csv = find_initial_csv(run_dir)
+    init_path = find_initial_frame(run_dir)
     df = pd.read_csv(calib_csv)
-    df_initial = pd.read_csv(init_csv) if init_csv else None
+    df_initial = read_table(init_path) if init_path else None
 
-    # print(f"Using calibrated file: {calib_csv}")
-
-    # if init_csv:
-    #     print(f"Using initial file: {init_csv}")
+    if init_path is None:
+        print("No initial assignment found; Figure 2 will omit the Initial series.")
 
     census_dir = run_dir / "census_data"
-    dept_path = census_dir / "census_depart_times.csv"
-    tt_path = census_dir / "travel_time_to_work.csv"
-    dept_df = pd.read_csv(dept_path) if dept_path.exists() else None
-    tt_df = pd.read_csv(tt_path) if tt_path.exists() else None
+    dept_path = find_census_table(census_dir, "census_depart_times")
+    tt_path = find_census_table(census_dir, "travel_time_to_work")
+    dept_df = read_table(dept_path) if dept_path else None
+    tt_df = read_table(tt_path) if tt_path else None
 
     if dept_df is None:
-        print("No census_depart_times.csv found; Figure 1 will show generated only.")
+        print("No census_depart_times table found; Figure 1 will show generated only.")
     if tt_df is None:
-        print("No travel_time_to_work.csv found; Figure 2 will show generated only.")
+        print("No travel_time_to_work table found; Figure 2 will show generated only.")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
