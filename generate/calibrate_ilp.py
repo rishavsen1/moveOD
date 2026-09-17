@@ -195,7 +195,13 @@ def fill_travel_times(routes, cand):
         cand.loc[missing, "travel_time_min"] = cand.loc[missing].apply(
             lambda r: med_tt.get((r.origin_geoid, r.destination_geoid), np.nan), axis=1
         )
-        cand.loc[missing, "travel_distance_mi"] = cand.loc[missing, "travel_time_min"] / 2
+        # Use the observed median distance for the same O-D pair. The previous
+        # travel_time_min / 2 fabricated a distance at an implied 30 mph and
+        # presented it as measured.
+        med_dist = routes.groupby(["origin_geoid", "destination_geoid"])["travel_distance_mi"].median()
+        cand.loc[missing, "travel_distance_mi"] = cand.loc[missing].apply(
+            lambda r: med_dist.get((r.origin_geoid, r.destination_geoid), np.nan), axis=1
+        )
 
     cand = cand.drop(columns=["_merge"])
 
@@ -746,6 +752,12 @@ def post_calibrating_assignment(calibrated_trips, origin_buildings, dest_buildin
     work_locs = pd.concat(work_locs)
 
     synthetic_df = synthetic_df.join(work_locs)
+
+    # calibrated_weight has served its purpose above: the frame is expanded so
+    # that one row is one trip, and the column now just repeats the parent
+    # cell's count on every copy. Leaving it invites summing it as a trip total,
+    # which double-counts (it yields sum of w^2, not sum of w).
+    synthetic_df = synthetic_df.drop(columns=["calibrated_weight"], errors="ignore")
 
     return synthetic_df
 
