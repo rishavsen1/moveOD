@@ -4,6 +4,7 @@ import ast
 import random
 import gc
 import psutil
+import zlib
 
 np.random.seed(123)
 
@@ -354,6 +355,12 @@ def _process_single_origin(args):
 
     o, cand_subset, od_probs, p_bo, q_so, w_od_prop, N_o, alpha, cplex_path = args
 
+    # Seed from the origin id, not from inherited process state. Workers are
+    # forked and each may handle several origins, so without this the sampling
+    # below depends on how origins happen to be distributed across the pool.
+    # crc32 is used rather than hash() because str hashing is salted per process.
+    np.random.seed(zlib.crc32(str(o).encode()) & 0xFFFFFFFF)
+
     result = {"origin": o, "df": None, "status": "skipped", "error": None}
 
     try:
@@ -637,6 +644,12 @@ def calibrate_with_strict_od_time_ilp(cand, od_df, p_dict, q_dict, w_dict, lodes
 
 
 def post_calibrating_assignment(calibrated_trips, origin_buildings, dest_buildings, ms_buildings_df):
+    # Seed both generators up front: sample_departure_time below uses the
+    # `random` module, which was never seeded here, while np.random.seed further
+    # down ran only after that sampling had already happened.
+    random.seed(42)
+    np.random.seed(42)
+
     df = calibrated_trips[calibrated_trips["calibrated_weight"] > 0].copy()
 
     # Vectorised expansion — avoids the O(N×weight) Python loop that
@@ -673,7 +686,6 @@ def post_calibrating_assignment(calibrated_trips, origin_buildings, dest_buildin
         synthetic_df["departure_time"], unit="s"
     )
 
-    np.random.seed(42)
     home_locs = []
     for o, grp in synthetic_df.groupby("origin_geoid"):
         houses = origin_buildings[origin_buildings.GEOID == str(o)]
