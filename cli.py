@@ -83,7 +83,9 @@ def deserialize_graphs(serialized_dict):
     deserialized = {}
     for key, encoded_str in serialized_dict.items():
         pickled = base64.b64decode(encoded_str.encode("utf-8"))
-        deserialized[key] = pickle.loads(pickled)
+        # serialize_graphs stringifies the Timestamp keys; convert them back, or
+        # every graph lookup (which is keyed by a floored Timestamp) silently misses.
+        deserialized[pd.Timestamp(key)] = pickle.loads(pickled)
     return deserialized
 
 
