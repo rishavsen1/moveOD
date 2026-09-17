@@ -72,21 +72,41 @@ from generate.logger import Logger
 # Serialization helpers (same as app.py)
 # ---------------------------------------------------------------------------
 def serialize_graphs(graphs_dict):
-    serialized = {}
+    """Serialise the hourly graphs, storing each distinct graph only once.
+
+    Many timestamps share the same graph object (peak / off-peak), so pickling
+    per timestamp would write the same bytes dozens of times.
+    """
+    slot_of = {}
+    graphs = {}
+    keys = {}
     for key, graph in graphs_dict.items():
-        pickled = pickle.dumps(graph)
-        serialized[str(key)] = base64.b64encode(pickled).decode("utf-8")
-    return serialized
+        gid = id(graph)
+        if gid not in slot_of:
+            slot_of[gid] = str(len(slot_of))
+            graphs[slot_of[gid]] = base64.b64encode(pickle.dumps(graph)).decode("utf-8")
+        keys[str(key)] = slot_of[gid]
+    return {"format": "shared-v1", "graphs": graphs, "keys": keys}
 
 
 def deserialize_graphs(serialized_dict):
-    deserialized = {}
-    for key, encoded_str in serialized_dict.items():
-        pickled = base64.b64decode(encoded_str.encode("utf-8"))
-        # serialize_graphs stringifies the Timestamp keys; convert them back, or
-        # every graph lookup (which is keyed by a floored Timestamp) silently misses.
-        deserialized[pd.Timestamp(key)] = pickle.loads(pickled)
-    return deserialized
+    """Inverse of serialize_graphs; also reads the older one-blob-per-key format.
+
+    Keys are restored as Timestamps: lookups use dep_time.floor(TIME_INTERVAL),
+    so leaving them as strings makes every lookup miss.
+    """
+    if serialized_dict.get("format") == "shared-v1":
+        loaded = {
+            slot: pickle.loads(base64.b64decode(blob.encode("utf-8")))
+            for slot, blob in serialized_dict["graphs"].items()
+        }
+        return {pd.Timestamp(key): loaded[slot] for key, slot in serialized_dict["keys"].items()}
+
+    # Legacy format: {timestamp_str: base64_pickle}
+    return {
+        pd.Timestamp(key): pickle.loads(base64.b64decode(blob.encode("utf-8")))
+        for key, blob in serialized_dict.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -691,25 +711,15 @@ def run_pipeline(
         gc.collect()
         logger.info("Freed post-calibration memory")
 
-        # Final routing on calibrated df
-        logger.info("Generating final routing for calibrated trips...")
-        # Reload hourly_graphs if needed (they may have been freed earlier)
-        if "hourly_graphs" not in locals() or hourly_graphs is None:
-            hourly_graphs = _ensure_hourly_graphs_loaded(None)
-            logger.info("Reloaded hourly graphs for final routing")
-        
-        routing_df = get_routed(
-            od_df=calibrated_df,
-            desired_date=start_date,
-            hourly_graphs_arg=hourly_graphs,
-            post_calibration=True,
-        )
-        
-        # Free graphs after final routing
-        del hourly_graphs, routing_df
+        # NOTE: a final post-calibration routing pass used to run here, but its
+        # result was discarded without being read -- roughly a third of all
+        # routing work for no output. The calibrated frame already carries
+        # travel_time_min and departure times. Re-add it only with a consumer.
+        if "hourly_graphs" in locals() and hourly_graphs is not None:
+            del hourly_graphs
         hourly_graphs = None
         gc.collect()
-        logger.info("Freed final routing memory")
+        logger.info("Freed routing memory")
 
         calibrated_df_out = f"{calibrated_output_path}/{day}.csv"
         calibrated_df.to_csv(calibrated_df_out)

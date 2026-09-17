@@ -186,24 +186,20 @@ def create_graphs_from_osm_speeds(G_base, desired_date):
     G_osm = G_base.copy()
     assign_osm_speeds_to_graph(G_osm)
 
-    # Since we don't have time-varying data, create the same graph for multiple hours
-    # You can adjust this based on your needs (e.g., create variations for peak/off-peak)
-    hourly_graphs = {}
+    # Without time-varying data there are only two distinct graphs -- peak and
+    # off-peak -- so build them once and point every timestamp at the shared
+    # object instead of materialising 48 identical copies.  Consumers treat these
+    # graphs as read-only; apply_mssr_to_existing_graphs copies before mutating.
+    G_offpeak = G_osm
+    G_peak = G_osm.copy()
+    apply_peak_hour_adjustments(G_peak, reduction_factor=0.7)
 
-    # Create graphs for a typical day (every 30 minutes as per TIME_INTERVAL)
+    hourly_graphs = {}
     base_date = pd.Timestamp(f"{desired_date}")
     for hour in range(0, 24):
-        for minute in [0, 30]:  # Every 30 minutes
+        for minute in [0, 30]:  # keys stay at 30-min resolution
             timestamp = base_date.replace(hour=hour, minute=minute)
-
-            # You could apply time-of-day speed adjustments here
-            G_hour = G_osm.copy()
-
-            # Optional: Apply peak hour speed reductions
-            if is_peak_hour(hour):
-                apply_peak_hour_adjustments(G_hour, reduction_factor=0.7)
-
-            hourly_graphs[timestamp] = G_hour
+            hourly_graphs[timestamp] = G_peak if is_peak_hour(hour) else G_offpeak
 
     G_0 = list(hourly_graphs.values())[0]
     return G_0, hourly_graphs

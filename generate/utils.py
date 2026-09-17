@@ -1459,7 +1459,16 @@ def apply_mssr_to_existing_graphs(hourly_graphs, psi):
 
     print(f"Applying speed adjustment factor: {speed_adjustment_factor:.4f}")
 
+    # hourly_graphs typically maps many timestamps onto a handful of shared graph
+    # objects (peak / off-peak).  Adjust each distinct object once and reuse it,
+    # otherwise this would expand them back into one copy per timestamp.
+    adjusted_by_source = {}
+
     for hour, G_hour in hourly_graphs.items():
+        if id(G_hour) in adjusted_by_source:
+            adjusted_graphs[hour] = adjusted_by_source[id(G_hour)]
+            continue
+
         # Create a copy of the graph
         G_adjusted = G_hour.copy()
 
@@ -1496,6 +1505,7 @@ def apply_mssr_to_existing_graphs(hourly_graphs, psi):
                 data["speed_kph"] = adjusted_speed
 
         print(f"Hour {hour}: Adjusted {default_edges} default edges, kept {inrix_edges} INRIX edges")
+        adjusted_by_source[id(G_hour)] = G_adjusted
         adjusted_graphs[hour] = G_adjusted
 
     return adjusted_graphs

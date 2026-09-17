@@ -31,23 +31,41 @@ import multiprocessing as mp
 
 
 def serialize_graphs(graphs_dict):
-    """Convert NetworkX graphs to JSON-serializable format using pickle+base64."""
-    serialized = {}
+    """Serialise the hourly graphs, storing each distinct graph only once.
+
+    Many timestamps share the same graph object (peak / off-peak), so pickling
+    per timestamp would write the same bytes dozens of times.
+    """
+    slot_of = {}
+    graphs = {}
+    keys = {}
     for key, graph in graphs_dict.items():
-        pickled = pickle.dumps(graph)
-        serialized[str(key)] = base64.b64encode(pickled).decode('utf-8')
-    return serialized
+        gid = id(graph)
+        if gid not in slot_of:
+            slot_of[gid] = str(len(slot_of))
+            graphs[slot_of[gid]] = base64.b64encode(pickle.dumps(graph)).decode('utf-8')
+        keys[str(key)] = slot_of[gid]
+    return {"format": "shared-v1", "graphs": graphs, "keys": keys}
 
 
 def deserialize_graphs(serialized_dict):
-    """Convert JSON data back to NetworkX graphs from pickle+base64 encoding."""
-    deserialized = {}
-    for key, encoded_str in serialized_dict.items():
-        pickled = base64.b64decode(encoded_str.encode('utf-8'))
-        # serialize_graphs stringifies the Timestamp keys; convert them back, or
-        # every graph lookup (which is keyed by a floored Timestamp) silently misses.
-        deserialized[pd.Timestamp(key)] = pickle.loads(pickled)
-    return deserialized
+    """Inverse of serialize_graphs; also reads the older one-blob-per-key format.
+
+    Keys are restored as Timestamps: lookups use dep_time.floor(TIME_INTERVAL),
+    so leaving them as strings makes every lookup miss.
+    """
+    if serialized_dict.get("format") == "shared-v1":
+        loaded = {
+            slot: pickle.loads(base64.b64decode(blob.encode('utf-8')))
+            for slot, blob in serialized_dict["graphs"].items()
+        }
+        return {pd.Timestamp(key): loaded[slot] for key, slot in serialized_dict["keys"].items()}
+
+    # Legacy format: {timestamp_str: base64_pickle}
+    return {
+        pd.Timestamp(key): pickle.loads(base64.b64decode(blob.encode('utf-8')))
+        for key, blob in serialized_dict.items()
+    }
 
 
 if __name__ == "__main__":

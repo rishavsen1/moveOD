@@ -17,6 +17,7 @@ from tqdm import tqdm
 import os
 import math
 import logging
+import pickle
 
 from generate.config import *
 from generate.utils import calculate_speed_shift, apply_mssr_to_existing_graphs
@@ -71,6 +72,44 @@ def get_census_time_bin_index(minutes_of_day):
 
 
 # ── Multiprocessing worker initializer & batch function ─────────────────────
+
+# A pickled OSM graph expands to roughly this much resident memory once a worker
+# unpickles it (measured ~5.7x on a county-sized graph).
+_GRAPH_RSS_PER_PICKLED_BYTE = 6.0
+
+
+def _safe_routing_workers(hourly_graphs, n_workers_requested):
+    """Throttle routing workers so the per-worker graph copies fit in RAM.
+
+    mp.Pool(initargs=...) sends a *full pickled copy* of the graph dict to every
+    worker -- this is not copy-on-write -- so N workers cost N graph copies.
+    """
+    try:
+        import psutil
+
+        avail_gb = psutil.virtual_memory().available / 1e9
+    except Exception:
+        return n_workers_requested
+
+    distinct = {id(G): G for G in hourly_graphs.values()}
+    if not distinct:
+        return n_workers_requested
+    # Measure one graph and scale: pickling every graph just to size them is
+    # itself expensive on a large county.
+    sample = len(pickle.dumps(next(iter(distinct.values()))))
+    est_rss_gb = _GRAPH_RSS_PER_PICKLED_BYTE * sample * len(distinct) / 1e9
+
+    per_worker_gb = max(est_rss_gb + 0.5, 1.0)
+    safe = max(1, int(avail_gb // per_worker_gb))
+    chosen = max(1, min(n_workers_requested, safe))
+    if chosen < n_workers_requested:
+        print(
+            f"[mem-guard] Throttling routing workers {n_workers_requested} -> {chosen} "
+            f"(avail {avail_gb:.1f} GB, ~{per_worker_gb:.1f} GB/worker, "
+            f"{len(distinct)} distinct graph(s))"
+        )
+    return chosen
+
 
 _worker_graphs = None  # Set per-worker by _init_worker
 
@@ -163,7 +202,7 @@ def _build_arrays_from_df(od_df, desired_date, post_calibration=False):
 
 # ── Main entry point ───────────────────────────────────────────────────────
 
-def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, parallel=False):
+def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, parallel=True):
     hourly_graphs = hourly_graphs_arg
     n_pairs = len(od_df)
 
@@ -200,6 +239,8 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
     #    core would be stuck on the 7am batch while others sit idle.
     n_workers = min((os.cpu_count() or 4) - 1, n_pairs)
     n_workers = max(1, n_workers)
+    if parallel:
+        n_workers = _safe_routing_workers(hourly_graphs, n_workers)
     # Target: ~equal-sized chunks across all workers
     target_chunk = max(50, math.ceil(n_pairs / n_workers))
 
@@ -223,8 +264,12 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
         _st_logger.setLevel(logging.ERROR)
         try:
             with mp.Pool(n_workers, initializer=_init_worker, initargs=(hourly_graphs,)) as pool:
+                # imap (ordered), not imap_unordered: the row order of routing_df
+                # feeds downstream sampling, so an unordered merge would make
+                # results depend on worker scheduling. Chunks are already sized
+                # evenly, so ordering costs little.
                 batch_results = list(
-                    tqdm(pool.imap_unordered(_route_batch, chunks),
+                    tqdm(pool.imap(_route_batch, chunks),
                          total=total_chunks, desc="Routing chunks")
                 )
         finally:
