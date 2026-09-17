@@ -91,7 +91,10 @@ streamlit run app.py
 5. Click the start button to run the pipeline.
 6. Watch progress in the UI and download the output when it finishes.
 
-Typical runtime is about 20 minutes for smaller regions and up to around 2 hours for larger ones.
+Typical runtime is a few minutes. Hamilton County, TN (~158,000 commuters)
+takes about 5 minutes end to end on a 32-thread machine, with a peak memory of
+roughly 6 GB. Routing runs in parallel across all available cores and is
+throttled automatically if memory is tight.
 
 ## Output
 
@@ -99,10 +102,13 @@ Outputs are written under `move_OD/{state}/{county}/{start_date}_{end_date}/`.
 
 Key results include:
 
-- `calibrated_move_od/{day}.csv` for the final OD trips.
+- `calibrated_move_od/{day}.csv` for the final OD trips. **One row is one trip.**
 - `intermediate/{day}/routing_df.parquet` for routed trips.
-- `intermediate/{day}/post_mssr_routing_df.parquet` after speed rescaling.
-- `intermediate/{day}/hourly_graphs_adjusted.json` for adjusted graphs.
+- `intermediate/{day}/post_mssr_routing_df.parquet` after the mean road speed shift.
+- `intermediate/{day}/hourly_graphs_adjusted.json` for adjusted graphs. Only
+  written when INRIX speeds are supplied; without them the speed shift is
+  uniform, so the shifted travel times are derived arithmetically rather than
+  by re-routing.
 
 Typical columns include origin and destination GEOIDs, sampled home and work coordinates, departure time, and estimated travel time.
 
