@@ -380,7 +380,7 @@ def _process_single_origin(args):
     from concurrent.futures import ProcessPoolExecutor, as_completed
     import multiprocessing
 
-    o, cand_subset, od_probs, p_bo, q_so, w_od_prop, N_o, alpha, cplex_path = args
+    o, cand_subset, od_probs, p_bo, q_so, w_od_prop, N_o, alpha, beta, cplex_path = args
 
     # Seed from the origin id, not from inherited process state. Workers are
     # forked and each may handle several origins, so without this the sampling
@@ -451,8 +451,12 @@ def _process_single_origin(args):
         for key in var:
             prob += var[key] - w_od[key] == g_minus[key] - g_plus[key]
 
-        # Objective
-        prob += pulp.lpSum(e_plus[b] + e_minus[b] for b in p_bo) + alpha * pulp.lpSum(
+        # Objective, matching the paper: alpha weights the travel-time slacks
+        # (eta) and beta the deviation from the initial OD distribution (zeta).
+        # The code previously pinned the eta term at 1 and applied `alpha` to the
+        # zeta term, i.e. its `alpha` played the paper's beta. Identical at
+        # alpha = beta = 1, but it made the paper's sweep impossible to express.
+        prob += alpha * pulp.lpSum(e_plus[b] + e_minus[b] for b in p_bo) + beta * pulp.lpSum(
             g_plus[key] + g_minus[key] for key in var
         )
 
@@ -553,7 +557,9 @@ def _safe_n_workers(cand_mem_bytes, n_workers_requested):
     return chosen
 
 
-def calibrate_with_strict_od_time_ilp(cand, od_df, p_dict, q_dict, w_dict, lodes_dict, alpha=1.0, n_workers=None):
+def calibrate_with_strict_od_time_ilp(
+    cand, od_df, p_dict, q_dict, w_dict, lodes_dict, alpha=1.0, beta=1.0, n_workers=None
+):
     """
     Integer calibration: assigns integer counts to (departure_time_bin, destination) cells
     to strictly match OD and departure time marginals for each origin,
@@ -618,7 +624,9 @@ def calibrate_with_strict_od_time_ilp(cand, od_df, p_dict, q_dict, w_dict, lodes
             p_bo = p_dict[o]
             q_so = q_dict[o]
             w_od_prop = w_dict.get(o, {}) if w_dict is not None else {}
-            work_items.append((o, cand_subset, od_probs, p_bo, q_so, w_od_prop, N_o, alpha, cplex_path))
+            work_items.append(
+                (o, cand_subset, od_probs, p_bo, q_so, w_od_prop, N_o, alpha, beta, cplex_path)
+            )
 
         if not work_items:
             continue
@@ -771,6 +779,8 @@ def calibrate_with_ilp(
     census_depart_times_df,
     travel_time_to_work_by_geoid,
     desired_date=None,
+    alpha=1.0,
+    beta=1.0,
 ):
 
     dep_tbl = census_depart_times_df.set_index("GEO_ID")
@@ -805,7 +815,14 @@ def calibrate_with_ilp(
 
     # Run calibration with strict OD and time distribution
     calibrated_trips = calibrate_with_strict_od_time_ilp(
-        cand=cand_with_bins, od_df=od_df, p_dict=p_dict, q_dict=q_dict, w_dict=w_dict, lodes_dict=lodes_dict, alpha=1
+        cand=cand_with_bins,
+        od_df=od_df,
+        p_dict=p_dict,
+        q_dict=q_dict,
+        w_dict=w_dict,
+        lodes_dict=lodes_dict,
+        alpha=alpha,
+        beta=beta,
     )
 
     calibrated_trips = post_calibrating_assignment(
