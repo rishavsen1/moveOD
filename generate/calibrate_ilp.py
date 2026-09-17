@@ -762,8 +762,13 @@ def calibrate_with_ilp(
 ):
 
     dep_tbl = census_depart_times_df.set_index("GEO_ID")
+    # Select the estimate columns by name, the same way get_departure_time_dist
+    # does. Slicing positionally (columns[2:-4:2]) assumed a fixed 34-column
+    # layout with estimate/margin pairs, and would silently mis-map the bins if
+    # the ACS response shape ever changed.
+    dep_est_cols = [c for c in dep_tbl.columns if c.endswith("_estimate") and c != "total_estimate"]
     dep_pos = {
-        o: [i for i, col in enumerate(dep_tbl.columns[2:-4:2]) if dep_tbl.loc[o, col] > 0] for o in dep_tbl.index
+        o: [i for i, col in enumerate(dep_est_cols) if dep_tbl.loc[o, col] > 0] for o in dep_tbl.index
     }
     empty_keys = [key for key, value in dep_pos.items() if not value]
     od_df = od_df[~od_df["h_geocode"].isin(empty_keys)]

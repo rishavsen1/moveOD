@@ -1040,25 +1040,6 @@ def add_shortest_path_and_speeds(df, graph, timestamp, inrix_dict, average_speed
     return df
 
 
-def add_shortest_path_and_speeds_parallel(
-    df, graph, timestamp, inrix_dict, average_speed_mps, average_speed_historical_mps
-):
-    num_partitions = int(cpu_count() / 8)
-    df_split = np.array_split(df, num_partitions)
-
-    with Pool(processes=num_partitions) as pool:
-        results = pool.starmap(
-            add_shortest_path_and_speeds,
-            [
-                (chunk, graph, timestamp, inrix_dict, average_speed_mps, average_speed_historical_mps)
-                for chunk in df_split
-            ],
-        )
-
-    df_combined = pd.concat(results, ignore_index=True)
-    return df_combined
-
-
 def format_probabilities(probabilities):
 
     probabilities = np.nan_to_num(probabilities, nan=0.0001)
