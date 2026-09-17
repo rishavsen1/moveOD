@@ -138,7 +138,7 @@ def _build_arrays_from_df(od_df, desired_date, post_calibration=False):
              departure_times, origin_geoids, dest_geoids).
     """
     if not post_calibration:
-        dep_ts = pd.to_datetime(od_df["departure_time"]).dt.floor(TIME_INTERVAL)
+        dep_ts = pd.to_datetime(od_df["departure_time"])
         origin_lats = od_df["origin_loc_lat"].values
         origin_lons = od_df["origin_loc_lon"].values
         dest_lats = od_df["dest_loc_lat"].values

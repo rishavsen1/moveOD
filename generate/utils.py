@@ -475,7 +475,8 @@ def get_census_data(api_key, api_url, table_name, state_fips, county_fips, block
         params["key"] = api_key
 
     response = requests.get(url, params=params)
-    print(response.url)
+    # Never print the API key: redact it from the logged URL
+    print(re.sub(r"([?&]key=)[^&]*", r"\1<redacted>", response.url))
 
     if response.status_code == 200:
         data = response.json()
