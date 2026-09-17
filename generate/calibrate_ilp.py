@@ -643,7 +643,7 @@ def calibrate_with_strict_od_time_ilp(cand, od_df, p_dict, q_dict, w_dict, lodes
         return pd.DataFrame()
 
 
-def post_calibrating_assignment(calibrated_trips, origin_buildings, dest_buildings, ms_buildings_df):
+def post_calibrating_assignment(calibrated_trips, origin_buildings, dest_buildings, ms_buildings_df, desired_date=None):
     # Seed both generators up front: sample_departure_time below uses the
     # `random` module, which was never seeded here, while np.random.seed further
     # down ran only after that sampling had already happened.
@@ -682,7 +682,10 @@ def post_calibrating_assignment(calibrated_trips, origin_buildings, dest_buildin
         # return np.random.randint(start, end + 1)
 
     synthetic_df["departure_time"] = synthetic_df["departure_time_bin"].apply(sample_departure_time)
-    synthetic_df["departure_datetime"] = pd.to_datetime("2025-03-10") + pd.to_timedelta(
+    # The run's own date, not a hardcoded one: with a literal here every run --
+    # and every day of a multi-day run -- stamped 2025-03-10.
+    base_date = pd.to_datetime(desired_date if desired_date is not None else "2025-03-10")
+    synthetic_df["departure_datetime"] = base_date + pd.to_timedelta(
         synthetic_df["departure_time"], unit="s"
     )
 
@@ -736,6 +739,7 @@ def calibrate_with_ilp(
     ms_buildings_df,
     census_depart_times_df,
     travel_time_to_work_by_geoid,
+    desired_date=None,
 ):
 
     dep_tbl = census_depart_times_df.set_index("GEO_ID")
@@ -768,6 +772,8 @@ def calibrate_with_ilp(
         cand=cand_with_bins, od_df=od_df, p_dict=p_dict, q_dict=q_dict, w_dict=w_dict, lodes_dict=lodes_dict, alpha=1
     )
 
-    calibrated_trips = post_calibrating_assignment(calibrated_trips, origin_buildings, dest_buildings, ms_buildings_df)
+    calibrated_trips = post_calibrating_assignment(
+        calibrated_trips, origin_buildings, dest_buildings, ms_buildings_df, desired_date=desired_date
+    )
 
     return calibrated_trips

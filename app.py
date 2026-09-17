@@ -646,6 +646,7 @@ if begin:
                     ms_buildings_df,
                     census_depart_times_df,
                     travel_time_to_work_df,
+                    desired_date=day,
                 )
 
                 # getting travel times for calibrated df
