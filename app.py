@@ -649,16 +649,15 @@ if begin:
                     desired_date=day,
                 )
 
-                # getting travel times for calibrated df
-                routing_df = get_routed(
-                    od_df=calibrated_df,
-                    desired_date=start_date,
-                    hourly_graphs=hourly_graphs,
-                    post_calibration=True,
-                )
-
+                # NOTE: a final post-calibration routing pass used to run here.
+                # It passed hourly_graphs= to get_routed, whose parameter is
+                # hourly_graphs_arg, so it raised TypeError before ever writing
+                # the output. Its result was also redundant: calibrated_df
+                # already carries travel_time_min and the departure times, which
+                # is what cli.py writes. Removing it fixes the crash and makes
+                # the Streamlit output identical to the CLI's.
                 calibrated_df_output_path = f"{calibrated_output_path}/{day}.csv"
-                routing_df.to_csv(calibrated_df_output_path)
+                calibrated_df.to_csv(calibrated_df_output_path)
                 st.session_state.calibrated_output_path = calibrated_output_path
 
             st.success("Calibrated ODs generated")
