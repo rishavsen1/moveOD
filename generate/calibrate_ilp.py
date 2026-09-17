@@ -341,6 +341,27 @@ def ipf_with_time_penalty(trips_o, od_probs, p_bo, max_iter=30):
     return weights
 
 
+def _apportion(weights, total):
+    """Split `total` across `weights` as integers summing exactly to `total`.
+
+    The paper's constraints (2) and (3) are exact equalities, which integers
+    cannot generally satisfy, so the targets have to be discretised. Largest
+    remainder keeps every target within 1 of its exact share and never goes
+    negative. The previous approach rounded and then pushed the whole residual
+    onto the last entry, which biased that bin/destination and -- when the
+    residual was negative and larger than it -- could make the ILP infeasible.
+    """
+    weights = np.asarray(weights, dtype=float)
+    share = weights / weights.sum() * total
+    floors = np.floor(share).astype(int)
+    remainder = int(total - floors.sum())
+    if remainder > 0:
+        # hand the leftover units to the largest fractional parts
+        order = np.argsort(-(share - floors), kind="stable")
+        floors[order[:remainder]] += 1
+    return floors
+
+
 def _process_single_origin(args):
     """
     Worker function to process a single origin for ILP calibration.
@@ -373,19 +394,17 @@ def _process_single_origin(args):
         destinations = sorted(trips_o.destination_geoid.unique())
         time_bins = sorted(trips_o.departure_time_bin.unique())
 
-        # Build OD and OS integer marginals (rounded, sum to N_o)
+        # Build OD and OS integer marginals (apportioned, sum to N_o)
         od_targets = np.array([od_probs.get(d, 0) for d in destinations])
         if od_targets.sum() > 0:
-            od_targets = np.round(od_targets / od_targets.sum() * N_o).astype(int)
-            od_targets[-1] += N_o - od_targets.sum()
+            od_targets = _apportion(od_targets, N_o)
         else:
             result["status"] = "no_od_targets"
             return result
 
         os_targets = np.array([q_so.get(s, 0) for s in time_bins])
         if os_targets.sum() > 0:
-            os_targets = np.round(os_targets / os_targets.sum() * N_o).astype(int)
-            os_targets[-1] += N_o - os_targets.sum()
+            os_targets = _apportion(os_targets, N_o)
         else:
             result["status"] = "no_os_targets"
             return result
