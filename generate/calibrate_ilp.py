@@ -433,19 +433,25 @@ def _process_single_origin(args):
         for j, s in enumerate(time_bins):
             prob += pulp.lpSum(var[(s, d)] for d in destinations if (s, d) in var) == os_targets[j]
 
+        # pi[(s, d)][b] = fraction of the candidates in cell (s, d) whose travel
+        # time falls in bin b.  sum_b pi[(s, d)][b] == 1, so summing this
+        # constraint over b reduces to sum(var) == N_o, matching the right-hand
+        # sides.  Using a 0/1 indicator instead would add each cell at full
+        # weight to every bin it touches, making the constraints unsatisfiable
+        # by construction and forcing the excess into the slacks.
+        cell_sizes = trips_o.groupby(["departure_time_bin", "destination_geoid"]).size()
+        cell_bin_counts = trips_o.groupby(["departure_time_bin", "destination_geoid", "time_bin"]).size()
+
+        pi = {}
+        for (s, d, b), n in cell_bin_counts.items():
+            total = cell_sizes[(s, d)]
+            if total > 0:
+                pi.setdefault(b, {})[(s, d)] = n / total
+
         for b, pbo in p_bo.items():
-            idx_cells = []
-            for key in var:
-                s, d = key
-                if (
-                    trips_o[
-                        (trips_o.departure_time_bin == s) & (trips_o.destination_geoid == d) & (trips_o.time_bin == b)
-                    ].shape[0]
-                    > 0
-                ):
-                    idx_cells.append(key)
-            if idx_cells:
-                prob += pulp.lpSum(var[key] for key in idx_cells) + e_minus[b] - e_plus[b] == int(round(pbo * N_o))
+            terms = [coef * var[key] for key, coef in pi.get(b, {}).items() if key in var]
+            if terms:
+                prob += pulp.lpSum(terms) + e_minus[b] - e_plus[b] == int(round(pbo * N_o))
 
         # Solve
         status = None

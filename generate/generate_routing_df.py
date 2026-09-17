@@ -251,10 +251,10 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
 
 
 def perform_mean_speed_shift(routing_df, travel_time_to_work_by_geoid, hourly_graphs):
-    mssr = calculate_speed_shift(routing_df, travel_time_to_work_by_geoid)
-    print(f"Mean Speed Shift Ratio (MSSr): {mssr:.4f}")
+    psi = calculate_speed_shift(routing_df, travel_time_to_work_by_geoid)
+    print(f"Mean Speed Shift Ratio (psi): {psi:.4f}")
 
     # Create hourly graphs with speed shift
-    hourly_graphs_adjusted = apply_mssr_to_existing_graphs(hourly_graphs, mssr)
+    hourly_graphs_adjusted = apply_mssr_to_existing_graphs(hourly_graphs, psi)
 
     return hourly_graphs_adjusted

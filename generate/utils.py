@@ -1436,23 +1436,25 @@ def calculate_speed_shift(routing_df, travel_time_to_work_by_geoid):
 
     mean_census_time = weighted_sum / total_commuters if total_commuters > 0 else 0
 
-    # Calculate MSSr
-    mssr = (mean_census_time - mean_simulated_time) / mean_census_time if mean_census_time > 0 else 0
+    # Mean road-speed shift: psi = tau_init / tau_ACS.
+    # Scaling every road speed by psi scales each edge travel time by 1/psi, so
+    # the mean simulated travel time lands exactly on the ACS mean.
+    psi = mean_simulated_time / mean_census_time if mean_census_time > 0 else 1.0
 
     print(f"Mean Simulated Travel Time: {mean_simulated_time:.2f} minutes")
     print(f"Mean Census Travel Time: {mean_census_time:.2f} minutes")
-    print(f"Mean Speed Shift Ratio (MSSr): {mssr:.4f}")
+    print(f"Mean Speed Shift Ratio (psi): {psi:.4f}")
 
-    return mssr
+    return psi
 
 
-def apply_mssr_to_existing_graphs(hourly_graphs, mssr):
+def apply_mssr_to_existing_graphs(hourly_graphs, psi):
     """
-    Apply Mean Speed Shift Ratio to existing hourly graphs.
+    Apply the mean road-speed shift psi to existing hourly graphs.
     Only modifies edges that don't have INRIX data.
     """
-    # Calculate speed adjustment factor
-    speed_adjustment_factor = 1.0 / (1.0 + mssr)
+    # psi is applied directly: v' = psi * v
+    speed_adjustment_factor = psi
     adjusted_graphs = {}
 
     print(f"Applying speed adjustment factor: {speed_adjustment_factor:.4f}")
@@ -1499,7 +1501,7 @@ def apply_mssr_to_existing_graphs(hourly_graphs, mssr):
     return adjusted_graphs
 
 
-def create_hourly_graphs_with_speed_shift(all_hours, hourly_inrix_df, conversion_df, mssr, default_speed_kmh=80):
+def create_hourly_graphs_with_speed_shift(all_hours, hourly_inrix_df, conversion_df, psi, default_speed_kmh=80):
     """
     Create hourly graphs with speed shift applied to default speed edges.
 
@@ -1511,8 +1513,8 @@ def create_hourly_graphs_with_speed_shift(all_hours, hourly_inrix_df, conversion
         DataFrame with INRIX speed data
     conversion_df : DataFrame
         DataFrame for mapping INRIX IDs to OSM edges
-    mssr : float
-        Mean Speed Shift Ratio
+    psi : float
+        Mean road-speed shift (tau_init / tau_ACS)
     default_speed_kmh : float, optional
         Default speed for edges without INRIX data (km/h)
 
@@ -1521,8 +1523,8 @@ def create_hourly_graphs_with_speed_shift(all_hours, hourly_inrix_df, conversion
     dict
         Dictionary of hourly graphs with adjusted speeds
     """
-    # Calculate speed adjustment factor (inverse of MSSR effect on time)
-    speed_adjustment_factor = 1.0 / (1.0 + mssr)
+    # psi is applied directly: v' = psi * v
+    speed_adjustment_factor = psi
     adjusted_default_speed = default_speed_kmh * speed_adjustment_factor
 
     print(
