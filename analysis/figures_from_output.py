@@ -6,6 +6,13 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
+# ACS B08303/B08603 travel-time bins, right-open: 4.99 -> "<5", 5.0 -> "5-9", 90 -> "90+".
+# The first edge is -1 rather than 0 so that a negative travel time (a routing
+# artefact) still lands in "<5" instead of falling outside the bins as NaN.
+TT_BIN_EDGES = [-1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 60, 90, 10**9]
+TT_BIN_LABELS = ["<5", "5-9", "10-14", "15-19", "20-24", "25-29", "30-34", "35-39", "40-44", "45-59", "60-89", "90+"]
+
+
 def find_run_dir(output_root: Path, state: str, county: str, run_id: str | None) -> Path:
     base = output_root / state / county
     if run_id:
@@ -262,8 +269,8 @@ def plot_departure_calibration(df: pd.DataFrame, dept_df: pd.DataFrame | None, o
 def plot_travel_time_distributions(
     df_calib: pd.DataFrame, df_init: pd.DataFrame | None, tt_df: pd.DataFrame | None, out_path: Path
 ) -> None:
-    tt_bins = [-1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 60, 90, 10**9]
-    tt_labels = ["<5", "5-9", "10-14", "15-19", "20-24", "25-29", "30-34", "35-39", "40-44", "45-59", "60-89", "90+"]
+    tt_bins = TT_BIN_EDGES
+    tt_labels = TT_BIN_LABELS
 
     def get_travel_time_minutes(frame: pd.DataFrame | None) -> pd.Series | None:
         if frame is None:
