@@ -9,6 +9,7 @@ import zlib
 np.random.seed(123)
 
 from generate.config import TIME_INTERVAL
+from generate.resources import plan_workers, usable_cpus, current_rss_bytes
 
 # ---------------------------------------------------------------------------
 # Memory helpers
@@ -540,23 +541,6 @@ def _process_single_origin(args):
     return result
 
 
-def _safe_n_workers(cand_mem_bytes, n_workers_requested):
-    """Throttle workers so forked children don't blow past available RAM.
-
-    Each fork-ed worker inherits a copy-on-write view of the parent.
-    In practice the child touches most pages (pandas / numpy / pulp),
-    so we budget ~(cand_mem + 0.5 GB) per worker.
-    """
-    avail = _available_gb()
-    per_worker_gb = max(cand_mem_bytes / 1e9 + 0.5, 1.0)
-    safe = max(1, int(avail // per_worker_gb))
-    chosen = min(n_workers_requested, safe)
-    if chosen < n_workers_requested:
-        print(f"[mem-guard] Throttling workers {n_workers_requested} → {chosen} "
-              f"(avail {avail:.1f} GB, ~{per_worker_gb:.1f} GB/worker)")
-    return chosen
-
-
 def calibrate_with_strict_od_time_ilp(
     cand, od_df, p_dict, q_dict, w_dict, lodes_dict, alpha=1.0, beta=1.0, n_workers=None
 ):
@@ -587,7 +571,7 @@ def calibrate_with_strict_od_time_ilp(
 
     # Determine number of workers
     if n_workers is None:
-        n_workers = max(1, mp.cpu_count() - 1)
+        n_workers = max(1, usable_cpus() - 1)
 
     # Get all origins to process
     origins = [
@@ -599,7 +583,12 @@ def calibrate_with_strict_od_time_ilp(
 
     # Memory-aware worker throttling
     cand_mem = cand.memory_usage(deep=True).sum()
-    n_workers = _safe_n_workers(cand_mem, n_workers)
+    # Budget the candidate frame on top of the parent image each child inherits.
+    n_workers = plan_workers(
+        n_workers,
+        per_worker_bytes=(current_rss_bytes() or 0) + cand_mem,
+        label="calibration workers",
+    )
 
     print(f"Calibrating {len(origins)} origins  "
           f"(cand {cand_mem / 1e6:.0f} MB, {n_workers} workers, "

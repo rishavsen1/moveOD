@@ -17,10 +17,10 @@ from tqdm import tqdm
 import os
 import math
 import logging
-import pickle
 
 from generate.config import *
 from generate.utils import calculate_speed_shift, apply_mssr_to_existing_graphs
+from generate.resources import plan_workers, usable_cpus
 
 
 # ── Pre-computed lookup tables (module-level constants) ─────────────────────
@@ -73,45 +73,8 @@ def get_census_time_bin_index(minutes_of_day):
 
 # ── Multiprocessing worker initializer & batch function ─────────────────────
 
-# A pickled OSM graph expands to roughly this much resident memory once a worker
-# unpickles it (measured ~5.7x on a county-sized graph).
-_GRAPH_RSS_PER_PICKLED_BYTE = 6.0
-
 # Aim for this many routing chunks per worker so a slow chunk cannot stall a core.
 CHUNKS_PER_WORKER = 4
-
-
-def _safe_routing_workers(hourly_graphs, n_workers_requested):
-    """Throttle routing workers so the per-worker graph copies fit in RAM.
-
-    mp.Pool(initargs=...) sends a *full pickled copy* of the graph dict to every
-    worker -- this is not copy-on-write -- so N workers cost N graph copies.
-    """
-    try:
-        import psutil
-
-        avail_gb = psutil.virtual_memory().available / 1e9
-    except Exception:
-        return n_workers_requested
-
-    distinct = {id(G): G for G in hourly_graphs.values()}
-    if not distinct:
-        return n_workers_requested
-    # Measure one graph and scale: pickling every graph just to size them is
-    # itself expensive on a large county.
-    sample = len(pickle.dumps(next(iter(distinct.values()))))
-    est_rss_gb = _GRAPH_RSS_PER_PICKLED_BYTE * sample * len(distinct) / 1e9
-
-    per_worker_gb = max(est_rss_gb + 0.5, 1.0)
-    safe = max(1, int(avail_gb // per_worker_gb))
-    chosen = max(1, min(n_workers_requested, safe))
-    if chosen < n_workers_requested:
-        print(
-            f"[mem-guard] Throttling routing workers {n_workers_requested} -> {chosen} "
-            f"(avail {avail_gb:.1f} GB, ~{per_worker_gb:.1f} GB/worker, "
-            f"{len(distinct)} distinct graph(s))"
-        )
-    return chosen
 
 
 _worker_graphs = None  # Set per-worker by _init_worker
@@ -124,51 +87,42 @@ def _init_worker(hourly_graphs):
 
 
 def _route_batch(args):
+    """Route one chunk of OD pairs that share an hourly graph.
+
+    The chunk arrives as numpy arrays rather than a list of per-trip tuples:
+    a Python tuple carrying a pandas Timestamp costs a few hundred bytes per
+    trip, which on a million-trip county dominates both the parent's footprint
+    (and therefore every forked child's) and the pickling cost of the results.
+    Results go back as arrays for the same reason.
     """
-    Route a batch of OD pairs that share the same hourly graph.
-    Receives (hour_key, task_list).
-    The worker reads the graph from its process-local _worker_graphs.
-    Each task is (orig_node, dest_node, dep_time, origin_geoid, dest_geoid).
-    Returns a list of result dicts (or None for failures).
-    """
-    hour_key, tasks = args
+    hour_key, orig_nodes, dest_nodes, dep_ns, row_idx = args
+    n = len(orig_nodes)
+
+    travel_time_s = np.full(n, np.nan, dtype=np.float64)
+    distance_m = np.full(n, np.nan, dtype=np.float64)
 
     G = _worker_graphs.get(hour_key)
     if G is None:
-        return [None] * len(tasks)
+        return row_idx, travel_time_s, distance_m
 
-    results = []
-    for orig_node, dest_node, dep_time, origin_geoid, dest_geoid in tasks:
+    for i in range(n):
         try:
-            route = nx.shortest_path(G, source=orig_node, target=dest_node, weight="travel_time")
-            # Walk edges once, accumulate both metrics
-            total_tt = 0.0
-            total_dist = 0.0
+            route = nx.shortest_path(
+                G, source=orig_nodes[i], target=dest_nodes[i], weight="travel_time"
+            )
+            tt = 0.0
+            dist = 0.0
             for u, v in zip(route[:-1], route[1:]):
                 edge = G[u][v][0]
-                total_tt += edge.get("travel_time", 0)
-                total_dist += edge.get("length", 0)
-            total_distance_mi = total_dist * _M_TO_MI
+                tt += edge.get("travel_time", 0)
+                dist += edge.get("length", 0)
+            travel_time_s[i] = tt
+            distance_m[i] = dist
         except nx.NetworkXNoPath:
-            total_tt = np.nan
-            total_distance_mi = np.inf
+            travel_time_s[i] = np.nan
+            distance_m[i] = np.inf
 
-        travel_time_min = total_tt / 60.0
-        dep_mins = dep_time.hour * 60 + dep_time.minute
-
-        results.append({
-            "origin_geoid": origin_geoid,
-            "destination_geoid": dest_geoid,
-            "origin_node": orig_node,
-            "destination_node": dest_node,
-            "departure_time": dep_time,
-            "departure_time_bin": get_census_time_bin_index(dep_mins),
-            "arrival_time": dep_time + pd.to_timedelta(total_tt, unit="s"),
-            "travel_time_min": travel_time_min,
-            "travel_time_bin": get_travel_time_bin(travel_time_min),
-            "travel_distance_mi": total_distance_mi,
-        })
-    return results
+    return row_idx, travel_time_s, distance_m
 
 
 # ── Vectorized OD-pair builders (no iterrows) ──────────────────────────────
@@ -225,54 +179,64 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
     orig_nodes = ox.distance.nearest_nodes(G_0, X=origin_lons, Y=origin_lats)
     dest_nodes = ox.distance.nearest_nodes(G_0, X=dest_lons, Y=dest_lats)
 
-    # 3) Group tasks by hourly graph key for cache-locality
-    #    Each graph is only looked-up once per batch instead of per-pair.
-    from collections import defaultdict
-    hour_buckets = defaultdict(list)
-    for i in range(n_pairs):
-        dep_time = departure_times.iloc[i] if hasattr(departure_times, 'iloc') else departure_times[i]
-        hour_key = dep_time.floor(TIME_INTERVAL)
-        hour_buckets[hour_key].append((
-            orig_nodes[i], dest_nodes[i], dep_time,
-            origin_geoids[i], dest_geoids[i],
-        ))
+    # 3) Group by hourly graph, vectorised. Everything downstream travels as
+    #    numpy arrays: one Python tuple per trip (carrying a pandas Timestamp)
+    #    costs hundreds of bytes, which on a million-trip county dominates the
+    #    parent's footprint and hence every forked child's.
+    dep_ns = departure_times.values.astype("datetime64[ns]").astype(np.int64)
+    hour_floor = pd.DatetimeIndex(departure_times).floor(TIME_INTERVAL)
+    orig_nodes = np.asarray(orig_nodes)
+    dest_nodes = np.asarray(dest_nodes)
 
-    # 4) Sub-chunk large hourly batches so work distributes evenly across cores.
-    #    E.g. if 7am has 5000 pairs and 11pm has 50, without sub-chunking one
-    #    core would be stuck on the 7am batch while others sit idle.
-    n_workers = min((os.cpu_count() or 4) - 1, n_pairs)
-    n_workers = max(1, n_workers)
+    order = np.argsort(hour_floor.asi8, kind="stable")
+    sorted_keys = hour_floor.asi8[order]
+    boundaries = np.flatnonzero(np.diff(sorted_keys)) + 1
+    groups = np.split(order, boundaries)
+
+    n_workers = max(1, min(usable_cpus() - 1, n_pairs))
     if parallel:
-        n_workers = _safe_routing_workers(hourly_graphs, n_workers)
-    # Target several chunks per worker, not one: hourly buckets are very uneven
-    # (rush hour dominates), so one chunk per worker leaves most of them idle
-    # waiting on the largest bucket.
+        # Sized from the parent's own RSS: each forked child starts from the
+        # parent's image, so that -- not the graph alone -- is the per-worker cost.
+        n_workers = plan_workers(n_workers, label="routing workers")
+    # Several chunks per worker: hourly buckets are very uneven (rush hour
+    # dominates), so one chunk each leaves most cores idle on the biggest bucket.
     target_chunk = max(50, math.ceil(n_pairs / (n_workers * CHUNKS_PER_WORKER)))
 
     chunks = []
-    for hour_key, tasks in hour_buckets.items():
-        # Split this hour's tasks into sub-chunks
-        for start in range(0, len(tasks), target_chunk):
-            chunks.append((hour_key, tasks[start : start + target_chunk]))
+    for idx in groups:
+        if len(idx) == 0:
+            continue
+        hour_key = pd.Timestamp(hour_floor.asi8[idx[0]])
+        for beg in range(0, len(idx), target_chunk):
+            sel = idx[beg : beg + target_chunk]
+            chunks.append(
+                (hour_key, orig_nodes[sel], dest_nodes[sel], dep_ns[sel], sel)
+            )
 
     total_chunks = len(chunks)
-    print(f"Grouped into {len(hour_buckets)} hourly buckets → {total_chunks} chunks for {n_workers} workers")
+    print(f"Grouped into {len(groups)} hourly buckets -> {total_chunks} chunks for {n_workers} workers")
 
-    # 5) Execute with multiprocessing.Pool (fork) for true parallelism.
-    #    fork is the only start method that works inside Streamlit's script runner
-    #    (forkserver/spawn fail with KeyError: '__main__').
-    #    We silence the harmless ScriptRunContext warnings that forked workers emit.
+    # 4) Execute. fork is the only start method that works inside Streamlit's
+    #    script runner (forkserver/spawn fail with KeyError: '__main__').
     if parallel and total_chunks > 1:
         print(f"Routing in parallel using {n_workers} processes")
         _st_logger = logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context")
         _prev_level = _st_logger.level
         _st_logger.setLevel(logging.ERROR)
+
+        # With fork, children inherit hourly_graphs through the parent's address
+        # space. Passing it via initargs would pickle it and rebuild a *second*
+        # copy inside every child.
+        if mp.get_start_method(allow_none=True) == "fork":
+            _init_worker(hourly_graphs)
+            pool_kwargs = {}
+        else:
+            pool_kwargs = {"initializer": _init_worker, "initargs": (hourly_graphs,)}
+
         try:
-            with mp.Pool(n_workers, initializer=_init_worker, initargs=(hourly_graphs,)) as pool:
-                # imap (ordered), not imap_unordered: the row order of routing_df
-                # feeds downstream sampling, so an unordered merge would make
-                # results depend on worker scheduling. Chunks are already sized
-                # evenly, so ordering costs little.
+            with mp.Pool(n_workers, **pool_kwargs) as pool:
+                # imap (ordered) keeps results reproducible; row_idx makes the
+                # ordering explicit regardless.
                 batch_results = list(
                     tqdm(pool.imap(_route_batch, chunks),
                          total=total_chunks, desc="Routing chunks")
@@ -281,17 +245,38 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
             _st_logger.setLevel(_prev_level)
     else:
         print("Routing sequentially")
-        _init_worker(hourly_graphs)  # set up the global for single-process path
+        _init_worker(hourly_graphs)
         batch_results = [
-            _route_batch(chunk)
-            for chunk in tqdm(chunks, desc="Routing chunks")
+            _route_batch(chunk) for chunk in tqdm(chunks, desc="Routing chunks")
         ]
 
-    # 5) Flatten & filter
-    all_results = [r for batch in batch_results for r in batch if r is not None]
-    print(f"Done: {len(all_results)}/{n_pairs} succeeded")
+    # 5) Scatter the per-chunk arrays back into full-length columns
+    travel_time_s = np.full(n_pairs, np.nan, dtype=np.float64)
+    distance_m = np.full(n_pairs, np.nan, dtype=np.float64)
+    for row_idx, tt, dist in batch_results:
+        travel_time_s[row_idx] = tt
+        distance_m[row_idx] = dist
 
-    routing_df = pd.DataFrame(all_results)
+    routed = np.isfinite(travel_time_s)
+    print(f"Done: {int(routed.sum())}/{n_pairs} succeeded")
+
+    travel_time_min = travel_time_s / 60.0
+    dep_index = pd.DatetimeIndex(departure_times)
+    routing_df = pd.DataFrame({
+        "origin_geoid": origin_geoids,
+        "destination_geoid": dest_geoids,
+        "origin_node": orig_nodes,
+        "destination_node": dest_nodes,
+        "departure_time": dep_index,
+        "departure_time_bin": [
+            get_census_time_bin_index(m) for m in (dep_index.hour * 60 + dep_index.minute)
+        ],
+        "arrival_time": dep_index + pd.to_timedelta(travel_time_s, unit="s"),
+        "travel_time_min": travel_time_min,
+        "travel_time_bin": [get_travel_time_bin(v) for v in travel_time_min],
+        "travel_distance_mi": distance_m * _M_TO_MI,
+    })
+    routing_df = routing_df[routed].reset_index(drop=True)
 
     if len(routing_df) > 0:
         print(f"Unique origin CBGs: {routing_df['origin_geoid'].nunique()}")
