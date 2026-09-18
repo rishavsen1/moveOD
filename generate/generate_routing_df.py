@@ -10,6 +10,8 @@ import geopandas as gpd
 from shapely.geometry import LineString
 import osmnx as ox
 import networkx as nx
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
 import numpy as np
 from bisect import bisect_right
 import multiprocessing as mp
@@ -76,8 +78,53 @@ def get_census_time_bin_index(minutes_of_day):
 # Aim for this many routing chunks per worker so a slow chunk cannot stall a core.
 CHUNKS_PER_WORKER = 4
 
+# A chunk's SSSP result is (sources x nodes) for both distances and
+# predecessors, so cap sources per chunk to keep that matrix bounded.
+_SSSP_MATRIX_BUDGET_BYTES = 128 << 20  # 128 MB
+_SSSP_BYTES_PER_CELL = 12              # float64 distance + int32 predecessor
+
 
 _worker_graphs = None  # Set per-worker by _init_worker
+_worker_csr = {}       # hour_key -> compiled CSR view of that hour's graph
+
+
+def _compile_graph(G):
+    """Compile a MultiDiGraph into CSR form for scipy's Dijkstra.
+
+    For each node pair the *minimum* travel_time edge is kept, which is the edge
+    nx.shortest_path would have followed, and that same edge's length is kept
+    alongside it so distances correspond to the chosen route. (Summing every
+    parallel edge, as a naive csr_matrix build does, would inflate the weights.)
+    """
+    nodes = list(G.nodes())
+    node_idx = {n: i for i, n in enumerate(nodes)}
+
+    best = {}
+    for u, v, data in G.edges(data=True):
+        key = (node_idx[u], node_idx[v])
+        tt = float(data.get("travel_time", 0.0))
+        prev = best.get(key)
+        if prev is None or tt < prev[0]:
+            best[key] = (tt, float(data.get("length", 0.0)))
+
+    n = len(nodes)
+    rows = np.fromiter((k[0] for k in best), dtype=np.int32, count=len(best))
+    cols = np.fromiter((k[1] for k in best), dtype=np.int32, count=len(best))
+    times = np.fromiter((v[0] for v in best.values()), dtype=np.float64, count=len(best))
+    matrix = csr_matrix((times, (rows, cols)), shape=(n, n))
+    lengths = {k: v[1] for k, v in best.items()}
+    return node_idx, matrix, lengths
+
+
+def _graph_view(hour_key):
+    view = _worker_csr.get(hour_key)
+    if view is None:
+        G = _worker_graphs.get(hour_key)
+        if G is None:
+            return None
+        view = _compile_graph(G)
+        _worker_csr[hour_key] = view
+    return view
 
 
 def _init_worker(hourly_graphs):
@@ -87,40 +134,60 @@ def _init_worker(hourly_graphs):
 
 
 def _route_batch(args):
-    """Route one chunk of OD pairs that share an hourly graph.
+    """Route one chunk via one single-source Dijkstra per distinct origin.
 
-    The chunk arrives as numpy arrays rather than a list of per-trip tuples:
-    a Python tuple carrying a pandas Timestamp costs a few hundred bytes per
-    trip, which on a million-trip county dominates both the parent's footprint
-    (and therefore every forked child's) and the pickling cost of the results.
-    Results go back as arrays for the same reason.
+    Dijkstra already computes the distance to every node on the way to any one
+    of them, so routing per trip re-explores the graph once per trip even when
+    trips share an origin. Here each distinct origin is solved once and every
+    destination is an array lookup.
+
+    The distance returned is the true optimal cost, so this also avoids
+    re-summing the path with G[u][v][0], which picks edge key 0 rather than the
+    minimum-weight parallel edge the router actually followed.
     """
-    hour_key, orig_nodes, dest_nodes, dep_ns, row_idx = args
-    n = len(orig_nodes)
+    hour_key, src_nodes, trip_src_pos, trip_dst_nodes, row_idx = args
+    n_trips = len(row_idx)
 
-    travel_time_s = np.full(n, np.nan, dtype=np.float64)
-    distance_m = np.full(n, np.nan, dtype=np.float64)
+    travel_time_s = np.full(n_trips, np.nan, dtype=np.float64)
+    distance_m = np.full(n_trips, np.inf, dtype=np.float64)
 
-    G = _worker_graphs.get(hour_key)
-    if G is None:
+    view = _graph_view(hour_key)
+    if view is None:
         return row_idx, travel_time_s, distance_m
+    node_idx, matrix, lengths = view
 
-    for i in range(n):
-        try:
-            route = nx.shortest_path(
-                G, source=orig_nodes[i], target=dest_nodes[i], weight="travel_time"
-            )
-            tt = 0.0
-            dist = 0.0
-            for u, v in zip(route[:-1], route[1:]):
-                edge = G[u][v][0]
-                tt += edge.get("travel_time", 0)
-                dist += edge.get("length", 0)
-            travel_time_s[i] = tt
-            distance_m[i] = dist
-        except nx.NetworkXNoPath:
-            travel_time_s[i] = np.nan
-            distance_m[i] = np.inf
+    src_cols = np.array([node_idx[s] for s in src_nodes], dtype=np.int64)
+    dist, pred = dijkstra(
+        matrix, directed=True, indices=src_cols, return_predecessors=True
+    )
+    if dist.ndim == 1:                      # scipy squeezes a single source
+        dist = dist[None, :]
+        pred = pred[None, :]
+
+    for t in range(n_trips):
+        si = trip_src_pos[t]
+        dj = node_idx.get(trip_dst_nodes[t])
+        if dj is None:
+            continue
+        cost = dist[si, dj]
+        if not np.isfinite(cost):
+            continue
+        travel_time_s[t] = cost
+
+        # Walk the predecessor tree back to the origin, accumulating the length
+        # of the same edges the cost was built from.
+        total = 0.0
+        cur = dj
+        root = src_cols[si]
+        row = pred[si]
+        while cur != root:
+            prev = row[cur]
+            if prev < 0:
+                total = np.inf
+                break
+            total += lengths.get((prev, cur), 0.0)
+            cur = prev
+        distance_m[t] = total
 
     return row_idx, travel_time_s, distance_m
 
@@ -202,19 +269,43 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
     # dominates), so one chunk each leaves most cores idle on the biggest bucket.
     target_chunk = max(50, math.ceil(n_pairs / (n_workers * CHUNKS_PER_WORKER)))
 
+    # Chunk by *distinct origin* rather than by trip, so each origin's SSSP runs
+    # exactly once. Sources per chunk are capped so the (sources x nodes) result
+    # matrices stay bounded on large graphs.
     chunks = []
+    n_sources_total = 0
     for idx in groups:
         if len(idx) == 0:
             continue
         hour_key = pd.Timestamp(hour_floor.asi8[idx[0]])
-        for beg in range(0, len(idx), target_chunk):
-            sel = idx[beg : beg + target_chunk]
-            chunks.append(
-                (hour_key, orig_nodes[sel], dest_nodes[sel], dep_ns[sel], sel)
-            )
+        G = hourly_graphs.get(hour_key)
+        n_nodes = G.number_of_nodes() if G is not None else 1
+        cap = max(1, _SSSP_MATRIX_BUDGET_BYTES // max(1, n_nodes * _SSSP_BYTES_PER_CELL))
+
+        hour_origins = orig_nodes[idx]
+        uniq, inverse = np.unique(hour_origins, return_inverse=True)
+        n_sources_total += len(uniq)
+        per_chunk = int(min(cap, max(1, math.ceil(len(uniq) / (n_workers * CHUNKS_PER_WORKER)))))
+
+        for beg in range(0, len(uniq), per_chunk):
+            src_sel = np.arange(beg, min(beg + per_chunk, len(uniq)))
+            keep = np.isin(inverse, src_sel)
+            if not keep.any():
+                continue
+            trip_pos = idx[keep]
+            chunks.append((
+                hour_key,
+                uniq[src_sel],
+                (inverse[keep] - beg).astype(np.int32),
+                dest_nodes[trip_pos],
+                trip_pos,
+            ))
 
     total_chunks = len(chunks)
-    print(f"Grouped into {len(groups)} hourly buckets -> {total_chunks} chunks for {n_workers} workers")
+    print(
+        f"Grouped into {len(groups)} hourly buckets -> {total_chunks} chunks for "
+        f"{n_workers} workers ({n_sources_total:,} distinct origins for {n_pairs:,} trips)"
+    )
 
     # 4) Execute. fork is the only start method that works inside Streamlit's
     #    script runner (forkserver/spawn fail with KeyError: '__main__').
