@@ -135,13 +135,24 @@ def get_initial_od_dist(od_df):
 
     od_df["departure_time_bin"] = pd.cut(mins, bins=dep_edges, labels=dep_labels, right=False).astype(int)
 
-    w_dict = (
-        od_df.groupby(["h_geocode", "departure_time_bin", "w_geocode"])
-        .size()
-        .groupby(level=0)  # normalise per origin
-        .apply(lambda v: (v / v.sum()).to_dict())
-        .to_dict()
-    )
+    # Proportion of each origin's trips falling in cell (departure bin,
+    # destination), keyed by origin so the ILP's w_dict.get(origin) resolves.
+    #
+    # This previously went through groupby(level=0).apply(lambda v: ...to_dict()).
+    # SeriesGroupBy.apply expands a dict return into the cross product of every
+    # group against every key seen in any group, so the result was
+    # n_origins x n_cells rather than n_cells -- 1,830 x 1.17M cells on
+    # Miami-Dade, about 2.1 billion entries and ~168 GB. It also produced keys
+    # shaped (origin, (origin, bin, dest)) instead of origin, so every lookup in
+    # the ILP missed and the beta term (the paper's L1 penalty against the
+    # initial OD distribution) was silently inert: with var >= 0 and
+    # sum(var) == N_o fixed, minimising sum|var - 0| is a constant.
+    counts = od_df.groupby(["h_geocode", "departure_time_bin", "w_geocode"]).size()
+    props = counts / counts.groupby(level=0).transform("sum")
+
+    w_dict = {}
+    for (origin, dep_bin, dest), share in props.items():
+        w_dict.setdefault(origin, {})[(dep_bin, dest)] = share
 
     return w_dict
 
