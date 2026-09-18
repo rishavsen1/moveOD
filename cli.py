@@ -372,6 +372,15 @@ def build_parser():
         "--inrix-conversion-path", type=str, default="", help="INRIX conversion CSV path"
     )
     parser.add_argument(
+        "--alpha", type=float, default=1.0,
+        help="ILP weight on the travel-time slacks (the paper's alpha; default 1.0)",
+    )
+    parser.add_argument(
+        "--beta", type=float, default=1.0,
+        help="ILP weight on deviation from the initial OD distribution "
+             "(the paper's beta; default 1.0). Use 0 to drop the anchor term.",
+    )
+    parser.add_argument(
         "--interactive",
         "-i",
         action="store_true",
@@ -395,6 +404,8 @@ def run_pipeline(
     safe_df,
     inrix_path,
     inrix_conversion_path,
+    alpha=1.0,
+    beta=1.0,
 ):
     """Core pipeline — equivalent to pressing BEGIN in the Streamlit app."""
 
@@ -724,6 +735,8 @@ def run_pipeline(
             census_depart_times_df,
             travel_time_to_work_df,
             desired_date=day,
+            alpha=alpha,
+            beta=beta,
         )
         
         # Free post-MSSR routing data and adjusted graphs after calibration
@@ -866,6 +879,8 @@ def main():
         safe_df=safe_df,
         inrix_path=inrix_path,
         inrix_conversion_path=inrix_conversion_path,
+        alpha=args.alpha,
+        beta=args.beta,
     )
 
 
