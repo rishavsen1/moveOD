@@ -107,3 +107,6 @@ routing/
 graphify-out
 .env
 CLAUDE.md
+
+# Rendered brag video, its Hyperframes projects and inlined datasets
+brag-output/
