@@ -86,6 +86,9 @@ _SSSP_BYTES_PER_CELL = 12              # float64 distance + int32 predecessor
 
 _worker_graphs = None  # Set per-worker by _init_worker
 _worker_csr = {}       # hour_key -> compiled CSR view of that hour's graph
+_worker_nodes = {}     # hour_key -> inverse of that view's node_idx
+_worker_edge_loads = False  # Set per-worker by _init_worker; see _route_batch
+_worker_load_hours = "departure"  # "departure" or "traversal"; see _route_batch
 
 
 def _compile_graph(G):
@@ -127,10 +130,79 @@ def _graph_view(hour_key):
     return view
 
 
-def _init_worker(hourly_graphs):
-    """Called once per worker process to store the shared graphs in its global scope."""
-    global _worker_graphs
+def _graph_nodes(hour_key):
+    """Compiled index -> OSM node id, i.e. the inverse of a view's node_idx.
+
+    Cached beside the view because it is only needed when edge loads are being
+    collected, and then only once per view rather than once per chunk.
+    """
+    nodes = _worker_nodes.get(hour_key)
+    if nodes is None:
+        node_idx = _graph_view(hour_key)[0]
+        nodes = [None] * len(node_idx)
+        for node, i in node_idx.items():
+            nodes[i] = node
+        _worker_nodes[hour_key] = nodes
+    return nodes
+
+
+def _init_worker(hourly_graphs, collect_edge_loads=False, load_hours="departure"):
+    """Called once per worker process to store the shared graphs in its global scope.
+
+    The edge-load settings travel as globals rather than inside every chunk's
+    args tuple so _route_batch reads them once instead of unpacking them per
+    chunk.
+    """
+    global _worker_graphs, _worker_edge_loads, _worker_load_hours
+    if hourly_graphs is not _worker_graphs:
+        # The compiled views are keyed by hour alone, so they must not outlive
+        # the graphs they came from: routing a second set of graphs over the
+        # same hour keys (cli.py does exactly that, base then MSSR-adjusted)
+        # would otherwise be answered from the first set's cache.
+        _worker_csr.clear()
+        _worker_nodes.clear()
     _worker_graphs = hourly_graphs
+    _worker_edge_loads = collect_edge_loads
+    _worker_load_hours = load_hours
+
+
+def _walk_route(pred_row, dist_row, dest, root, lengths, by_hour,
+                hour_bucket, dep_s):
+    """Walk the predecessor tree from dest back to root, summing edge lengths.
+
+    When by_hour is given each traversed edge is also counted into it: under
+    hour_bucket, or -- when dep_s (the trip's departure, seconds since the
+    epoch) is given instead -- under the hour the trip is actually on the edge.
+    """
+    bucket = None
+    if by_hour is not None and hour_bucket is not None:
+        bucket = by_hour.setdefault(hour_bucket, {})
+    total = 0.0
+    cur = dest
+    while cur != root:
+        prev = pred_row[cur]
+        if prev < 0:
+            return np.inf
+        total += lengths.get((prev, cur), 0.0)
+        if by_hour is not None:
+            if dep_s is not None:
+                # dist_row[prev] is the time from the origin to this edge's
+                # tail, so this is when the trip is actually on the edge.
+                bucket = by_hour.setdefault(int((dep_s + dist_row[prev]) // 3600), {})
+            bucket[(prev, cur)] = bucket.get((prev, cur), 0) + 1
+        cur = prev
+    return total
+
+
+def _merge_edge_loads(batch_results):
+    """Sum the per-chunk {hour_key: {(u, v): trips}} maps into one."""
+    edge_loads = {}
+    for _, _, _, loads in batch_results:
+        for hour_key, per_edge in (loads or {}).items():
+            bucket = edge_loads.setdefault(hour_key, {})
+            for edge, count in per_edge.items():
+                bucket[edge] = bucket.get(edge, 0) + count
+    return edge_loads
 
 
 def _route_batch(args):
@@ -144,17 +216,34 @@ def _route_batch(args):
     The distance returned is the true optimal cost, so this also avoids
     re-summing the path with G[u][v][0], which picks edge key 0 rather than the
     minimum-weight parallel edge the router actually followed.
+
+    The fourth return value is None unless _init_worker armed edge-load
+    collection, in which case it is {hour_key: {(u, v): trips}} counted during
+    the predecessor walk this function already performs. Under load_hours
+    "traversal" an edge is filed under the hour the trip is actually on it
+    rather than the hour it departed, so one chunk can return several hours.
     """
-    hour_key, src_nodes, trip_src_pos, trip_dst_nodes, row_idx = args
+    (hour_key, src_nodes, trip_src_pos, trip_dst_nodes, row_idx,
+     trip_dep_s) = args
     n_trips = len(row_idx)
+    collect = _worker_edge_loads
+    traversal = collect and _worker_load_hours == "traversal"
 
     travel_time_s = np.full(n_trips, np.nan, dtype=np.float64)
     distance_m = np.full(n_trips, np.inf, dtype=np.float64)
 
     view = _graph_view(hour_key)
     if view is None:
-        return row_idx, travel_time_s, distance_m
+        return row_idx, travel_time_s, distance_m, None
     node_idx, matrix, lengths = view
+
+    # Loads are bucketed by whole hours since the epoch, which is what a
+    # traversal timestamp floors to. hour_key is floored explicitly rather than
+    # assumed to be on the hour: a sub-hourly TIME_INTERVAL would otherwise put
+    # a fractional value here.
+    by_hour = {} if collect else None
+    dep_bucket = (int(pd.Timestamp(hour_key).floor("1H").value // 3_600_000_000_000)
+                  if collect else 0)
 
     src_cols = np.array([node_idx[s] for s in src_nodes], dtype=np.int64)
     dist, pred = dijkstra(
@@ -174,22 +263,24 @@ def _route_batch(args):
             continue
         travel_time_s[t] = cost
 
-        # Walk the predecessor tree back to the origin, accumulating the length
-        # of the same edges the cost was built from.
-        total = 0.0
-        cur = dj
-        root = src_cols[si]
-        row = pred[si]
-        while cur != root:
-            prev = row[cur]
-            if prev < 0:
-                total = np.inf
-                break
-            total += lengths.get((prev, cur), 0.0)
-            cur = prev
-        distance_m[t] = total
+        # cost is finite, so the walk always reaches the root and the counts it
+        # writes are never left half-finished.
+        distance_m[t] = _walk_route(
+            pred[si], dist[si], dj, src_cols[si], lengths, by_hour,
+            None if traversal else dep_bucket,
+            trip_dep_s[t] if traversal else None,
+        )
 
-    return row_idx, travel_time_s, distance_m
+    if not collect:
+        return row_idx, travel_time_s, distance_m, None
+
+    nodes = _graph_nodes(hour_key)
+    named = {
+        pd.Timestamp(hour * 3600, unit="s"):
+            {(nodes[a], nodes[b]): c for (a, b), c in per_edge.items()}
+        for hour, per_edge in by_hour.items()
+    }
+    return row_idx, travel_time_s, distance_m, named
 
 
 # ── Vectorized OD-pair builders (no iterrows) ──────────────────────────────
@@ -226,12 +317,29 @@ def _build_arrays_from_df(od_df, desired_date, post_calibration=False):
 
 # ── Main entry point ───────────────────────────────────────────────────────
 
-def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, parallel=True):
+def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False,
+               parallel=True, return_edge_loads: bool = False,
+               edge_load_hours: str = "departure"):
+    """Route every OD pair; with return_edge_loads also count trips per edge.
+
+    With return_edge_loads set the return value becomes
+    (routing_df, {hour_key: {(u, v): trips}}) where (u, v) are OSM node ids of
+    the edges the routes actually traversed. routing_df itself is unaffected.
+
+    edge_load_hours picks which hour an edge is filed under: "departure" keys
+    every edge of a trip by the hour the trip left, "traversal" by the hour the
+    trip is actually on that edge. Only the latter is comparable with an hourly
+    traffic count.
+    """
+    if edge_load_hours not in ("departure", "traversal"):
+        raise ValueError(
+            f"edge_load_hours must be 'departure' or 'traversal', got {edge_load_hours!r}"
+        )
     hourly_graphs = hourly_graphs_arg
     n_pairs = len(od_df)
 
     if n_pairs == 0:
-        return pd.DataFrame()
+        return (pd.DataFrame(), {}) if return_edge_loads else pd.DataFrame()
 
     # 1) Vectorized data extraction (replaces iterrows + dict building)
     (origin_lats, origin_lons, dest_lats, dest_lons,
@@ -251,6 +359,10 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
     #    costs hundreds of bytes, which on a million-trip county dominates the
     #    parent's footprint and hence every forked child's.
     dep_ns = departure_times.values.astype("datetime64[ns]").astype(np.int64)
+    # Seconds since the epoch, so a worker can add a travel time to a departure
+    # and floor the result to an hour. Only traversal-hour loads need it.
+    need_dep_s = return_edge_loads and edge_load_hours == "traversal"
+    dep_s = dep_ns / 1e9 if need_dep_s else None
     hour_floor = pd.DatetimeIndex(departure_times).floor(TIME_INTERVAL)
     orig_nodes = np.asarray(orig_nodes)
     dest_nodes = np.asarray(dest_nodes)
@@ -299,6 +411,7 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
                 (inverse[keep] - beg).astype(np.int32),
                 dest_nodes[trip_pos],
                 trip_pos,
+                dep_s[trip_pos] if need_dep_s else None,
             ))
 
     total_chunks = len(chunks)
@@ -319,10 +432,13 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
         # space. Passing it via initargs would pickle it and rebuild a *second*
         # copy inside every child.
         if mp.get_start_method(allow_none=True) == "fork":
-            _init_worker(hourly_graphs)
+            _init_worker(hourly_graphs, return_edge_loads, edge_load_hours)
             pool_kwargs = {}
         else:
-            pool_kwargs = {"initializer": _init_worker, "initargs": (hourly_graphs,)}
+            pool_kwargs = {
+                "initializer": _init_worker,
+                "initargs": (hourly_graphs, return_edge_loads, edge_load_hours),
+            }
 
         try:
             with mp.Pool(n_workers, **pool_kwargs) as pool:
@@ -336,7 +452,7 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
             _st_logger.setLevel(_prev_level)
     else:
         print("Routing sequentially")
-        _init_worker(hourly_graphs)
+        _init_worker(hourly_graphs, return_edge_loads, edge_load_hours)
         batch_results = [
             _route_batch(chunk) for chunk in tqdm(chunks, desc="Routing chunks")
         ]
@@ -344,9 +460,10 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
     # 5) Scatter the per-chunk arrays back into full-length columns
     travel_time_s = np.full(n_pairs, np.nan, dtype=np.float64)
     distance_m = np.full(n_pairs, np.nan, dtype=np.float64)
-    for row_idx, tt, dist in batch_results:
+    for row_idx, tt, dist, _ in batch_results:
         travel_time_s[row_idx] = tt
         distance_m[row_idx] = dist
+    edge_loads = _merge_edge_loads(batch_results) if return_edge_loads else {}
 
     routed = np.isfinite(travel_time_s)
     print(f"Done: {int(routed.sum())}/{n_pairs} succeeded")
@@ -373,7 +490,53 @@ def get_routed(od_df, desired_date, hourly_graphs_arg, post_calibration=False, p
         print(f"Unique origin CBGs: {routing_df['origin_geoid'].nunique()}")
         print(f"Unique destination CBGs: {routing_df['destination_geoid'].nunique()}")
 
+    if return_edge_loads:
+        return routing_df, edge_loads
     return routing_df
+
+
+def edge_loads_to_frame(edge_loads, G) -> gpd.GeoDataFrame:
+    """Turn get_routed's edge loads into a GeoDataFrame, one row per edge-hour.
+
+    Where parallel edges exist the *minimum travel_time* one is described, which
+    is the edge _compile_graph keeps and therefore the edge the loads were
+    counted on. (Minimum length would pick a different edge: the two criteria
+    only agree when parallel edges share a speed.)
+    """
+    wanted = {edge for per_edge in edge_loads.values() for edge in per_edge}
+    best = {}
+    for u, v, data in G.edges(data=True):
+        if (u, v) not in wanted:
+            continue
+        tt = float(data.get("travel_time", 0.0))
+        if (u, v) not in best or tt < best[(u, v)][0]:
+            best[(u, v)] = (tt, data)
+
+    rows = []
+    for hour_key, per_edge in edge_loads.items():
+        for (u, v), load in per_edge.items():
+            entry = best.get((u, v))
+            data = entry[1] if entry else {}
+            highway = data.get("highway")
+            rows.append({
+                "u": u,
+                "v": v,
+                "hour": pd.Timestamp(hour_key),
+                "load": load,
+                "length_m": float(data.get("length", 0.0)),
+                "highway": highway[0] if isinstance(highway, list) else highway,
+                "geometry": data.get("geometry") or LineString(
+                    [(G.nodes[u]["x"], G.nodes[u]["y"]),
+                     (G.nodes[v]["x"], G.nodes[v]["y"])]
+                ),
+            })
+
+    return gpd.GeoDataFrame(
+        rows,
+        columns=["u", "v", "hour", "load", "length_m", "highway", "geometry"],
+        geometry="geometry",
+        crs=G.graph.get("crs", "epsg:4326"),
+    )
 
 
 def mean_speed_shift_is_uniform(hourly_graphs):
