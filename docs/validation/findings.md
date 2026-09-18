@@ -58,6 +58,12 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
   the synthetic AM split is 71 % southbound against 54 % observed, and the southbound synthetic
   count exceeds the full observed count (ratio 1.23), which a commute subset cannot do. Shortest
   path concentrates the Hixson → Chattanooga commute on one carriageway.
+- **Single-building census units.** Face validity on Hamilton finds one home coordinate carrying
+  all 605 commuters of block group 470650101032 and two work coordinates carrying all 5,237 jobs of
+  470650016003. `origin_metadata.json` shows those units had one (or two) candidate locations: the
+  tiered selection keeps the tagged-OSM set however small instead of falling back to Microsoft
+  footprints. This is the concentration failure the paper's introduction argues against; a
+  minimum-candidate threshold before falling back would remove it.
 - **TMAS data contradiction at 000540.** The station file signs N/S, the volume file E/W; the E/W
   cone reaches only residential cross streets (ratios 0.008 and 0.002). Drop both rows from any
   headline figure: pooled AM ratio without them is 0.499 (n 8).
