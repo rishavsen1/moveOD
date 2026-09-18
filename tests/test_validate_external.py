@@ -7,6 +7,7 @@ import pytest
 from analysis.validate_external import (
     CALIB_STEM_RE,
     DEP_BIN_MIDPOINTS,
+    TLFD_BIN_EDGES,
     TT_BIN_LABELS,
     bin_departure_minutes,
     bin_travel_minutes,
@@ -15,6 +16,7 @@ from analysis.validate_external import (
     js_distance,
     largest_remainder_round,
     normalize_geoid,
+    run_face_validity_test,
     to_trip_frame,
     total_variation_distance,
     truncate_geoid,
@@ -230,3 +232,105 @@ def test_calibrated_stem_filter_accepts_days_and_rejects_helpers():
     assert all(CALIB_STEM_RE.match(stem) for stem in accepted)
     assert not any(CALIB_STEM_RE.match(stem) for stem in rejected)
     assert CALIB_STEM_RE.match("Polk_2025-03-10").group(1) == "2025-03-10"
+
+
+# --------------------------------------------------------------------------- face validity
+
+
+def _metric(rows: list[dict], name: str) -> float:
+    """Pull the single row with this metric name out of `run_face_validity_test`'s output."""
+    matches = [row["value"] for row in rows if row["metric"] == name]
+    assert len(matches) == 1, f"expected exactly one {name!r} row, got {len(matches)}"
+    return matches[0]
+
+
+def _face_validity_frame(**overrides) -> pd.DataFrame:
+    base = {
+        "origin_geoid": ["470650004001"],
+        "destination_geoid": ["470650004001"],
+        "travel_time_min_filled": [10.0],
+    }
+    base.update(overrides)
+    return pd.DataFrame(base)
+
+
+def test_face_validity_rows_are_tagged_calibrated_county():
+    rows = run_face_validity_test(_face_validity_frame())
+    assert rows  # at least one metric was produced
+    assert all(row["method"] == "calibrated" for row in rows)
+    assert all(row["test"] == "face_validity" for row in rows)
+    assert all(row["geography"] == "county" for row in rows)
+
+
+def test_implied_speed_excludes_zero_travel_time_and_flags_share_thresholds():
+    frame = _face_validity_frame(
+        origin_geoid=[1, 1, 1, 1, 1],
+        destination_geoid=[2, 2, 2, 2, 2],
+        travel_time_min_filled=[0.0, 10.0, 5.0, 2.0, 30.0],
+        travel_distance_mi=[5.0, 2.0, 5.0, 5.0, 1.0],
+    )
+    rows = run_face_validity_test(frame)
+
+    # distance is present on all 5 rows, but the zero-travel-time row is excluded
+    # from every implied-speed metric (12, 60, 150 and 2 mph -- 4 values, not 5).
+    assert _metric(rows, "n_trips_with_distance") == pytest.approx(5.0)
+    assert _metric(rows, "implied_speed_mph_p50") == pytest.approx(np.percentile([12.0, 60.0, 150.0, 2.0], 50))
+    assert _metric(rows, "share_over_80mph") == pytest.approx(0.25)  # only the 150 mph trip
+    assert _metric(rows, "share_under_3mph") == pytest.approx(0.25)  # only the 2 mph trip
+
+
+def test_intra_bg_and_intra_tract_share_on_four_trips():
+    geoid_a = "470650004001"  # tract 47065000400, block group 1
+    geoid_b = "470650004002"  # same tract, block group 2
+    geoid_c = "470650009001"  # different tract
+    frame = _face_validity_frame(
+        origin_geoid=[geoid_a, geoid_a, geoid_a, geoid_b],
+        destination_geoid=[geoid_a, geoid_b, geoid_c, geoid_b],
+        travel_time_min_filled=[10.0, 10.0, 10.0, 10.0],
+    )
+    rows = run_face_validity_test(frame)
+
+    # (a,a) and (b,b) stay in one BG; (a,a), (a,b) and (b,b) stay in one tract.
+    assert _metric(rows, "share_intra_bg") == pytest.approx(0.5)
+    assert _metric(rows, "share_intra_tract") == pytest.approx(0.75)
+
+
+def test_commuters_per_point_aggregates_duplicated_coordinates():
+    n_home_a, n_home_b, n_work = 12, 3, 15
+    assert n_home_a + n_home_b == n_work
+    frame = _face_validity_frame(
+        origin_geoid=[1] * n_work,
+        destination_geoid=[2] * n_work,
+        travel_time_min_filled=[10.0] * n_work,
+        origin_lat=[40.0] * n_home_a + [40.1] * n_home_b,
+        origin_lon=[-85.0] * n_home_a + [-85.1] * n_home_b,
+        destination_lat=[41.0] * n_work,
+        destination_lon=[-86.0] * n_work,
+    )
+    rows = run_face_validity_test(frame)
+
+    assert _metric(rows, "home_pts_n") == pytest.approx(2.0)
+    assert _metric(rows, "commuters_per_home_pt_max") == pytest.approx(12.0)
+    assert _metric(rows, "share_home_pts_over_10") == pytest.approx(0.5)  # only the 12-trip point
+    assert _metric(rows, "work_pts_n") == pytest.approx(1.0)
+    assert _metric(rows, "commuters_per_work_pt_max") == pytest.approx(15.0)
+    assert not any(row["metric"] == "share_work_pts_over_10" for row in rows)
+
+
+def test_tlfd_shares_sum_to_one():
+    # One trip per bin, including the open-ended 50+ bin.
+    distances = [0.5, 1.5, 2.5, 4.0, 6.0, 8.0, 12.0, 17.0, 25.0, 40.0, 60.0]
+    assert len(distances) == len(TLFD_BIN_EDGES) - 1
+    frame = _face_validity_frame(
+        origin_geoid=list(range(len(distances))),
+        destination_geoid=list(range(len(distances))),
+        travel_time_min_filled=[10.0] * len(distances),
+        travel_distance_mi=distances,
+    )
+    rows = run_face_validity_test(frame)
+
+    tlfd_rows = [row for row in rows if row["metric"].startswith("tlfd_share_")]
+    assert len(tlfd_rows) == len(distances)
+    assert sum(row["value"] for row in tlfd_rows) == pytest.approx(1.0)
+    # each bin got exactly one of the eleven trips
+    assert all(row["value"] == pytest.approx(1.0 / len(distances)) for row in tlfd_rows)

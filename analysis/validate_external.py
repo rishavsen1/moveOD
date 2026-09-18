@@ -493,6 +493,155 @@ def _joint_metrics(method: str, merged: pd.DataFrame, geography: str) -> list[di
     return rows
 
 
+# --------------------------------------------------------------------------- face validity
+
+# Trip-length frequency distribution bin edges, in miles; right-open, last bin unbounded.
+TLFD_BIN_EDGES = [0, 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 50, np.inf]
+
+
+def _face_validity_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Pull geoids, coordinates, travel time and distance straight off a calibrated CSV.
+
+    Unlike `to_trip_frame`, this keeps `travel_distance_mi` and both endpoints'
+    coordinates, which the held-out ACS-comparison tests never need. Missing
+    optional columns (distance, coordinates) are filled with NaN rather than
+    raising, so older runs still get whichever face-validity metrics they can.
+    """
+    origin_col = pick_first_col(frame, ["origin_geoid", "origin_bg", "h_geocode"])
+    dest_col = pick_first_col(frame, ["destination_geoid", "dest_geoid", "dest_bg", "w_geocode"])
+    tt_col = pick_first_col(frame, ["travel_time_min_filled", "travel_time_min", "travel_time_minutes"])
+    missing = [name for name, col in
+               [("origin", origin_col), ("destination", dest_col), ("travel time", tt_col)] if col is None]
+    if missing:
+        raise KeyError(f"Trip table is missing column(s) for face validity: {', '.join(missing)}")
+
+    dist_col = pick_first_col(frame, ["travel_distance_mi", "distance_mi", "travel_distance_miles"])
+    olat_col = pick_first_col(frame, ["origin_lat"])
+    olon_col = pick_first_col(frame, ["origin_lon"])
+    dlat_col = pick_first_col(frame, ["destination_lat", "dest_lat"])
+    dlon_col = pick_first_col(frame, ["destination_lon", "dest_lon"])
+
+    trips = pd.DataFrame(
+        {
+            "origin_geoid": normalize_geoid(frame[origin_col]),
+            "dest_geoid": normalize_geoid(frame[dest_col]),
+            "tt_min": pd.to_numeric(frame[tt_col], errors="coerce"),
+            "travel_distance_mi": pd.to_numeric(frame[dist_col], errors="coerce") if dist_col else np.nan,
+        }
+    )
+    for label, lat_col, lon_col in (("origin", olat_col, olon_col), ("dest", dlat_col, dlon_col)):
+        if lat_col and lon_col:
+            trips[f"{label}_lat"] = pd.to_numeric(frame[lat_col], errors="coerce").round(6)
+            trips[f"{label}_lon"] = pd.to_numeric(frame[lon_col], errors="coerce").round(6)
+    return trips
+
+
+def _implied_speed_rows(trips: pd.DataFrame) -> list[dict]:
+    """Implied mph = distance / travel time, for trips with a positive travel time."""
+    distance = trips["travel_distance_mi"]
+    has_distance = distance.notna()
+    rows = [{"metric": "n_trips_with_distance", "value": float(has_distance.sum()), "n_units": len(trips)}]
+
+    valid = has_distance & trips["tt_min"].notna() & (trips["tt_min"] > 0)
+    n_valid = int(valid.sum())
+    if n_valid == 0:
+        return rows
+    speed = distance[valid] / (trips.loc[valid, "tt_min"] / 60.0)
+    for pct in (10, 50, 90):
+        rows.append({"metric": f"implied_speed_mph_p{pct}", "value": float(np.percentile(speed, pct)),
+                     "n_units": n_valid})
+    rows.append({"metric": "share_over_80mph", "value": float((speed > 80).mean()), "n_units": n_valid})
+    rows.append({"metric": "share_under_3mph", "value": float((speed < 3).mean()), "n_units": n_valid})
+    return rows
+
+
+def _intra_geo_rows(trips: pd.DataFrame) -> list[dict]:
+    """Share of trips that stay within one block group / tract."""
+    n = len(trips)
+    if n == 0:
+        return [{"metric": "share_intra_bg", "value": float("nan"), "n_units": 0},
+                {"metric": "share_intra_tract", "value": float("nan"), "n_units": 0}]
+    intra_bg = float((trips["origin_geoid"] == trips["dest_geoid"]).mean())
+    intra_tract = float((trips["origin_geoid"].str[:11] == trips["dest_geoid"].str[:11]).mean())
+    return [{"metric": "share_intra_bg", "value": intra_bg, "n_units": n},
+            {"metric": "share_intra_tract", "value": intra_tract, "n_units": n}]
+
+
+def _commuters_per_point_rows(
+    trips: pd.DataFrame, lat_col: str, lon_col: str, label: str, include_share: bool
+) -> list[dict]:
+    """Trips per distinct (lat, lon) point -- a proxy for commuters per building."""
+    if lat_col not in trips.columns or lon_col not in trips.columns:
+        return []
+    points = trips[[lat_col, lon_col]].dropna()
+    if points.empty:
+        return []
+    counts = points.groupby([lat_col, lon_col]).size()
+    n_pts = len(counts)
+    rows = [
+        {"metric": f"{label}_pts_n", "value": float(n_pts), "n_units": n_pts},
+        {"metric": f"commuters_per_{label}_pt_p50", "value": float(np.percentile(counts, 50)), "n_units": n_pts},
+        {"metric": f"commuters_per_{label}_pt_p90", "value": float(np.percentile(counts, 90)), "n_units": n_pts},
+        {"metric": f"commuters_per_{label}_pt_max", "value": float(counts.max()), "n_units": n_pts},
+    ]
+    if include_share:
+        rows.append({"metric": f"share_{label}_pts_over_10", "value": float((counts > 10).mean()),
+                     "n_units": n_pts})
+    return rows
+
+
+def _edge_label(edge: float) -> str:
+    """Format a TLFD bin edge for a metric name ("7.5", "20", "inf")."""
+    return "inf" if np.isinf(edge) else f"{edge:g}"
+
+
+def _tlfd_rows(trips: pd.DataFrame) -> list[dict]:
+    """Trip-length frequency distribution over `travel_distance_mi`.
+
+    Purely descriptive: no NHTS reference table is wired in yet.
+    """
+    # TODO(NHTS): compare these shares against the NHTS home-based-work trip
+    # length distribution once a reference extract is available.
+    distance = trips["travel_distance_mi"].dropna()
+    n = len(distance)
+    edges = TLFD_BIN_EDGES
+    if n == 0:
+        rows = [{"metric": f"tlfd_share_{_edge_label(lo)}_{_edge_label(hi)}", "value": float("nan"), "n_units": 0}
+                for lo, hi in zip(edges[:-1], edges[1:])]
+        return rows + [{"metric": "distance_mi_p50", "value": float("nan"), "n_units": 0},
+                       {"metric": "distance_mi_mean", "value": float("nan"), "n_units": 0}]
+
+    codes = pd.cut(distance, bins=edges, right=False, include_lowest=True)
+    shares = {interval: float(count) / n for interval, count in codes.value_counts(sort=False).items()}
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        share = shares.get(pd.Interval(lo, hi, closed="left"), 0.0)
+        rows.append({"metric": f"tlfd_share_{_edge_label(lo)}_{_edge_label(hi)}", "value": share, "n_units": n})
+    rows.append({"metric": "distance_mi_p50", "value": float(np.percentile(distance, 50)), "n_units": n})
+    rows.append({"metric": "distance_mi_mean", "value": float(distance.mean()), "n_units": n})
+    return rows
+
+
+def run_face_validity_test(frame: pd.DataFrame) -> list[dict]:
+    """Descriptive sanity checks on the calibrated trips only -- implied speed,
+    how much commuting stays within one BG/tract, commuters per home/work point,
+    and the trip-length frequency distribution. These have no external reference
+    data: they catch routing/geocoding artefacts (teleporting trips, everyone
+    living at one point) that the ACS-comparison tests above cannot see.
+    """
+    trips = _face_validity_frame(frame)
+    rows = (
+        _implied_speed_rows(trips)
+        + _intra_geo_rows(trips)
+        + _commuters_per_point_rows(trips, "origin_lat", "origin_lon", "home", include_share=True)
+        + _commuters_per_point_rows(trips, "dest_lat", "dest_lon", "work", include_share=False)
+        + _tlfd_rows(trips)
+    )
+    for row in rows:
+        row.update({"method": "calibrated", "test": "face_validity", "geography": "county"})
+    return rows
+
+
 # --------------------------------------------------------------------------- baselines
 
 
@@ -877,6 +1026,7 @@ def validate_run(run_dir: Path, calib_csv: Path, state: str, county: str, seed: 
     counts = sanity_counts(run_dir, methods["calibrated"], departures, arrival, state_fips, county_fips, acs_year)
     rows += [{"method": "reference", "test": "sanity", "geography": "county", "metric": key,
               "value": value, "n_units": 1} for key, value in counts.items()]
+    rows += run_face_validity_test(pd.read_csv(calib_csv))
 
     metrics = _finalise_metrics(rows, state, county, run_id_of(run_dir), day, seed)
     metrics.to_csv(out_dir / "metrics.csv", index=False)
@@ -950,6 +1100,22 @@ def _headline_table(metrics: pd.DataFrame, test: str, wanted: list[str]) -> str:
     return _markdown_table(table)
 
 
+def _face_validity_table(metrics: pd.DataFrame) -> str:
+    """One small table of headline face-validity numbers (calibrated method only)."""
+    wanted = [
+        "implied_speed_mph_p10", "implied_speed_mph_p50", "implied_speed_mph_p90",
+        "share_over_80mph", "share_under_3mph", "share_intra_bg", "share_intra_tract",
+        "home_pts_n", "commuters_per_home_pt_p50", "commuters_per_home_pt_p90",
+        "work_pts_n", "commuters_per_work_pt_p50", "commuters_per_work_pt_p90",
+        "distance_mi_p50", "distance_mi_mean",
+    ]
+    subset = metrics[(metrics["test"] == "face_validity") & metrics["metric"].isin(wanted)]
+    if subset.empty:
+        return "_No face-validity data._\n"
+    table = subset.set_index("metric")[["value"]].reindex(wanted).rename(columns={"value": "calibrated"})
+    return _markdown_table(table)
+
+
 def write_summary(path: Path, metrics: pd.DataFrame, counts: dict[str, float], state: str, county: str,
                   day: str, acs_year: int = ACS_YEAR) -> None:
     """Short markdown report: headline numbers, coverage and the sanity line."""
@@ -978,6 +1144,9 @@ def write_summary(path: Path, metrics: pd.DataFrame, counts: dict[str, float], s
         "which for Hamilton is 23.41 min (the 90+ bin counted as 105) against an ACS "
         "aggregate-minute mean of 21.66 min (B08013/B08303 and B08133/B08302 agree) -- a 1.75 "
         "min head start on the measured bias.\n",
+        "\n## Face validity\n",
+        "Descriptive checks on the calibrated trips alone, with no external reference data.\n",
+        _face_validity_table(metrics),
         "\n## Coverage\n",
         coverage_table,
     ]
