@@ -289,6 +289,60 @@ def profile_shape_correlation(df: pd.DataFrame,
     return pd.DataFrame(rows), pooled
 
 
+def per_site_am(df: pd.DataFrame, hours: Sequence[int] = AM_HOURS) -> pd.DataFrame:
+    """One row per station-direction: its own AM totals and ratio.
+
+    The pooled ratio is dominated by the busiest stations, so a site that is
+    matched to the wrong road disappears into it. This is the table that shows
+    it.
+    """
+    sub = df[df["hour_of_day"].isin(list(hours))]
+    carry = {c: (c, "first") for c in ("route", "highway", "match_kind", "n_edges",
+                                       "dir_in_sta")
+             if c in sub.columns}
+    out = sub.groupby(["station_id", "travel_dir"], as_index=False).agg(
+        observed_am=("observed", "sum"), synthetic_am=("synthetic", "sum"), **carry
+    )
+    out["ratio_am_site"] = np.where(out["observed_am"] > 0,
+                                    out["synthetic_am"] / out["observed_am"], np.nan)
+    return out.sort_values("observed_am", ascending=False).reset_index(drop=True)
+
+
+def leave_one_out_ratio(sites: pd.DataFrame) -> tuple[float, float]:
+    """Range of the pooled AM ratio when any one station-direction is dropped."""
+    if len(sites) < 2:
+        return float("nan"), float("nan")
+    observed, synthetic = sites["observed_am"].to_numpy(), sites["synthetic_am"].to_numpy()
+    kept_obs = observed.sum() - observed
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratios = np.where(kept_obs > 0, (synthetic.sum() - synthetic) / kept_obs, np.nan)
+    return float(np.nanmin(ratios)), float(np.nanmax(ratios))
+
+
+def between_within_r(df: pd.DataFrame, hours: Sequence[int] = AM_HOURS) -> dict:
+    """Split r(log1p) into agreement *between* sites and *within* each site.
+
+    A high pooled r can come entirely from big stations having big counts. The
+    between term is that; the within term is whether the hourly shape inside a
+    station tracks, which is the part a trip model should get right.
+    """
+    sub = df[df["hour_of_day"].isin(list(hours))].copy()
+    for column in ("synthetic", "observed"):
+        sub[f"log_{column}"] = np.log1p(sub[column])
+
+    totals = sub.groupby(["station_id", "travel_dir"])[["synthetic", "observed"]].sum()
+    r_between, n_between = _pearson(np.log1p(totals["synthetic"]),
+                                    np.log1p(totals["observed"]))
+    keys = ["station_id", "travel_dir"]
+    deviations = {
+        column: sub[f"log_{column}"] - sub.groupby(keys)[f"log_{column}"].transform("mean")
+        for column in ("synthetic", "observed")
+    }
+    r_within, n_within = _pearson(deviations["synthetic"], deviations["observed"])
+    return {"r_between": r_between, "n_between": n_between,
+            "r_within": r_within, "n_within": n_within}
+
+
 def _window_metrics(df: pd.DataFrame, hours: Sequence[int], label: str) -> dict:
     sub = df[df["hour_of_day"].isin(list(hours))]
     if sub.empty:
@@ -361,7 +415,8 @@ def _plot(df: pd.DataFrame, out_path: Path, title: str) -> None:
 
 
 def _append_summary(path: Path, metrics: dict, shapes: pd.DataFrame,
-                    unmatched: pd.DataFrame, df: pd.DataFrame) -> None:
+                    unmatched: pd.DataFrame, df: pd.DataFrame,
+                    sites_am: pd.DataFrame) -> None:
     hourly = df.groupby("hour_of_day")[["synthetic", "observed"]].sum()
     lines = [
         "", "## TMAS continuous-count stations", "",
@@ -374,6 +429,17 @@ def _append_summary(path: Path, metrics: dict, shapes: pd.DataFrame,
     lines += [f"| {name} | {value:.4g} |" for name, value in metrics.items()
               if not name.startswith("profile_shape_pearson__")
               and not name.startswith("ratio_hour_")]
+    lines += ["", "### Per station-direction, 05-10", "",
+              "| station | dir | route | matched OSM class | match | edges | "
+              "observed | synthetic | ratio | dir in .STA |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines += [
+        f"| {r.station_id} | {r.travel_dir} | {r.route} | {r.highway} | "
+        f"{r.match_kind} | {int(r.n_edges)} | {r.observed_am:,.0f} | "
+        f"{r.synthetic_am:,.1f} | {r.ratio_am_site:.3f} | "
+        f"{'yes' if r.dir_in_sta else '**no**'} |"
+        for r in sites_am.itertuples()
+    ]
     lines += ["", "### Synthetic / observed by hour", "",
               "| hour | observed | synthetic | ratio |", "| --- | --- | --- | --- |"]
     lines += [
@@ -405,17 +471,28 @@ def reporting_sites(stations: gpd.GeoDataFrame,
     points = stations.drop_duplicates(subset="station_id").set_index("station_id")
     reporting = volumes[["station_id", "travel_dir"]].drop_duplicates()
     reporting = reporting[reporting["station_id"].isin(points.index)]
-    return gpd.GeoDataFrame(
+    signed = set(zip(stations["station_id"], stations["travel_dir"]))
+    sites = gpd.GeoDataFrame(
         reporting.assign(
             route=points.loc[reporting["station_id"], "route"].to_numpy(),
             geometry=points.loc[reporting["station_id"], "geometry"].to_numpy(),
+            dir_in_sta=[t in signed
+                        for t in zip(reporting["station_id"], reporting["travel_dir"])],
         ),
         geometry="geometry", crs=stations.crs,
     )
+    for site in sites[~sites["dir_in_sta"]].itertuples():
+        logger.warning("TMAS %s dir %s (%s): this direction is not in the station "
+                       "file, which signs the station %s -- the bearing filter will "
+                       "follow the volume file and may reach the wrong road",
+                       site.station_id, site.travel_dir, site.route,
+                       sorted(d for s_, d in signed if s_ == site.station_id))
+    return sites
 
 
 def run(edges_all: gpd.GeoDataFrame, day, out_dir: Path, sta_path: Path,
-        vol_path: Path, county_code: int, context: dict) -> pd.DataFrame:
+        vol_path: Path, county_code: int, context: dict,
+        bearing_tol_deg: float = 45.0) -> pd.DataFrame:
     """Match TMAS stations to loaded edges and write the count comparison."""
     stations = read_stations(sta_path, county_code)
     stamp = pd.Timestamp(day)
@@ -428,7 +505,8 @@ def run(edges_all: gpd.GeoDataFrame, day, out_dir: Path, sta_path: Path,
 
     sites = reporting_sites(stations, volumes)
     edges_proj = ox.project_gdf(edges_all.drop_duplicates(subset=["u", "v"]))
-    matches = match_stations_to_edges(sites.to_crs(edges_proj.crs), edges_proj)
+    matches = match_stations_to_edges(sites.to_crs(edges_proj.crs), edges_proj,
+                                      bearing_tol_deg=bearing_tol_deg)
     matches, dropped = keep_highest_class(matches)
     for (station, direction), group in dropped.groupby(["station_id", "travel_dir"]):
         logger.info("TMAS %s dir %s: dropped %s (lower class than %s)", station,
@@ -443,10 +521,11 @@ def run(edges_all: gpd.GeoDataFrame, day, out_dir: Path, sta_path: Path,
                 len(sites) - len(unmatched), len(sites))
 
     kinds = matches.groupby(["station_id", "travel_dir"], as_index=False).agg(
-        match_kind=("match_kind", "min"), n_edges=("u", "size"))
+        match_kind=("match_kind", "min"), n_edges=("u", "size"),
+        highway=("highway", lambda s: "+".join(sorted(set(s.dropna())))))
     df = volumes.rename(columns={"count": "observed"}).merge(
         synthetic, on=["station_id", "travel_dir", "hour_of_day"], how="inner",
-    ).merge(sites[["station_id", "travel_dir", "route"]],
+    ).merge(sites[["station_id", "travel_dir", "route", "dir_in_sta"]],
             on=["station_id", "travel_dir"], how="left").merge(
         kinds, on=["station_id", "travel_dir"], how="left")
     if df.duplicated(["station_id", "travel_dir", "hour_of_day"]).any():
@@ -456,17 +535,33 @@ def run(edges_all: gpd.GeoDataFrame, day, out_dir: Path, sta_path: Path,
         return df
 
     metrics, shapes, _ = compute_metrics(df)
+    sites_am = per_site_am(df)
+    low, high = leave_one_out_ratio(sites_am)
+    metrics["ratio_am_leave_one_out_min"] = low
+    metrics["ratio_am_leave_one_out_max"] = high
+    metrics.update(between_within_r(df))
+    metrics["bearing_tol_deg"] = float(bearing_tol_deg)
     sites_matched = kinds["match_kind"].value_counts()
     metrics["n_station_dirs_matched_50m"] = float(sites_matched.get("50m", 0))
     metrics["n_station_dirs_matched_100m"] = float(sites_matched.get("100m", 0))
     metrics["n_station_dirs_unmatched"] = float(len(unmatched))
+
+    n_dirs = df.groupby(["station_id", "travel_dir"]).ngroups
     rows = [dict(context, tmas_day=str(day), metric=name, value=value,
-                 n_station_dirs=df.groupby(["station_id", "travel_dir"]).ngroups,
-                 n_unmatched=len(unmatched))
+                 n_station_dirs=n_dirs, n_unmatched=len(unmatched))
             for name, value in metrics.items()]
+    rows += [dict(context, tmas_day=str(day), metric="ratio_am_site",
+                  value=site.ratio_am_site, n_station_dirs=n_dirs,
+                  n_unmatched=len(unmatched), station_id=site.station_id,
+                  travel_dir=site.travel_dir, route=site.route,
+                  highway=site.highway, match_kind=site.match_kind,
+                  n_edges=site.n_edges, observed_am=site.observed_am,
+                  synthetic_am=site.synthetic_am, dir_in_sta=site.dir_in_sta)
+             for site in sites_am.itertuples()]
     pd.DataFrame(rows).to_csv(out_dir / "station_counts_metrics.csv", index=False)
     df.to_csv(out_dir / "station_counts_hourly.csv", index=False)
     _plot(df, out_dir / "station_counts.png",
           f"{context.get('county', '')} TMAS stations {day}: observed vs synthetic, 05-10")
-    _append_summary(out_dir / "link_loads_summary.md", metrics, shapes, unmatched, df)
+    _append_summary(out_dir / "link_loads_summary.md", metrics, shapes, unmatched,
+                    df, sites_am)
     return df

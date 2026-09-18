@@ -273,6 +273,87 @@ def test_geh_is_zero_for_a_perfect_match_and_known_otherwise():
     assert sc.geh([200.0], [100.0])[0] == pytest.approx(np.sqrt(2 * 100 ** 2 / 300))
 
 
+def _two_site_frame():
+    """Site A is matched well; site B is under-loaded by an order of magnitude."""
+    hours = [5, 6, 7]
+    return pd.DataFrame({
+        "station_id": ["A"] * 3 + ["B"] * 3,
+        "travel_dir": [1] * 6,
+        "route": ["000SR153"] * 6,
+        "highway": ["motorway"] * 3 + ["residential"] * 3,
+        "match_kind": ["50m"] * 6,
+        "hour_of_day": hours * 2,
+        "synthetic": [40.0, 50.0, 60.0] + [1.0, 2.0, 3.0],
+        "observed": [100.0, 100.0, 100.0] + [100.0, 100.0, 100.0],
+    })
+
+
+def test_a_volume_direction_missing_from_the_station_file_is_flagged():
+    """Hamilton 000540 is signed N/S in .STA but reports E/W in .VOL."""
+    stations = gpd.GeoDataFrame(
+        {"station_id": ["000540", "000540"], "travel_dir": [1, 5],
+         "route": ["000SR021"] * 2,
+         "geometry": [Point(-85.2666, 35.0270)] * 2},
+        crs="EPSG:4326",
+    )
+    volumes = pd.DataFrame({"station_id": ["000540", "000540"], "travel_dir": [3, 7]})
+    sites = sc.reporting_sites(stations, volumes)
+    assert list(sites["dir_in_sta"]) == [False, False]
+    assert list(sites["route"]) == ["000SR021"] * 2
+
+
+def test_a_volume_direction_present_in_the_station_file_is_not_flagged():
+    stations = gpd.GeoDataFrame(
+        {"station_id": ["000111"], "travel_dir": [1], "route": ["000SR153"],
+         "geometry": [Point(-85.2320, 35.1160)]},
+        crs="EPSG:4326",
+    )
+    volumes = pd.DataFrame({"station_id": ["000111"], "travel_dir": [1]})
+    assert list(sc.reporting_sites(stations, volumes)["dir_in_sta"]) == [True]
+
+
+def test_per_site_ratios_expose_what_the_pooled_number_hides():
+    out = sc.per_site_am(_two_site_frame(), hours=(5, 6, 7)).set_index("station_id")
+    assert out.loc["A", "observed_am"] == pytest.approx(300.0)
+    assert out.loc["A", "synthetic_am"] == pytest.approx(150.0)
+    assert out.loc["A", "ratio_am_site"] == pytest.approx(0.5)
+    assert out.loc["B", "ratio_am_site"] == pytest.approx(0.02)
+    assert out.loc["A", "highway"] == "motorway"
+    assert out.loc["A", "match_kind"] == "50m"
+
+
+def test_leave_one_out_brackets_the_pooled_ratio():
+    sites = sc.per_site_am(_two_site_frame(), hours=(5, 6, 7))
+    low, high = sc.leave_one_out_ratio(sites)
+    # pooled is 156/600 = 0.26; dropping B leaves 0.50, dropping A leaves 0.02
+    assert low == pytest.approx(0.02)
+    assert high == pytest.approx(0.5)
+
+
+def test_leave_one_out_is_nan_with_a_single_site():
+    sites = sc.per_site_am(_two_site_frame(), hours=(5, 6, 7)).head(1)
+    low, high = sc.leave_one_out_ratio(sites)
+    assert np.isnan(low) and np.isnan(high)
+
+
+def test_between_and_within_site_correlation_are_separated():
+    """Between sites the levels agree; within a site the shapes disagree."""
+    hours = [5, 6, 7]
+    df = pd.DataFrame({
+        "station_id": ["A"] * 3 + ["B"] * 3 + ["C"] * 3,
+        "travel_dir": [1] * 9,
+        "hour_of_day": hours * 3,
+        "synthetic": [10.0, 20.0, 30.0] + [100.0, 200.0, 300.0] + [1.0, 2.0, 3.0],
+        "observed": [30.0, 20.0, 10.0] + [300.0, 200.0, 100.0] + [3.0, 2.0, 1.0],
+    })
+    stats = sc.between_within_r(df, hours)
+    assert stats["n_between"] == 3
+    assert stats["n_within"] == 9
+    assert stats["r_between"] == pytest.approx(1.0), "site totals agree exactly"
+    # Not exactly -1: log1p bends the two sites' deviations differently.
+    assert stats["r_within"] < -0.95, "hourly shapes are reversed inside each site"
+
+
 def test_profile_shape_correlation_ignores_scale():
     hours = [5, 6, 7]
     df = pd.DataFrame({

@@ -51,6 +51,7 @@ from analysis.figures_from_output import find_run_dir
 from analysis.validate_external import code_sha
 from cli import deserialize_graphs
 from generate.generate_routing_df import edge_loads_to_frame, get_routed
+from generate.utils import apply_mssr_to_existing_graphs
 
 logger = logging.getLogger(__name__)
 
@@ -291,16 +292,59 @@ def decile_means(load: Iterable[float], congestion: Iterable[float],
 
 # ── Pipeline ────────────────────────────────────────────────────────────────
 
-def routed_edge_loads(run_dir: Path, load_hours: str = "traversal"
+def speed_shift_ratio(run_dir: Path) -> float | None:
+    """Recover the mean speed shift ratio psi the run applied after routing.
+
+    The pipeline rescales every road speed by psi once (v' = psi*v, so travel
+    times divide by psi) and the calibrated trips carry the shifted times, but
+    it only writes psi to the run log. rescale_routing_df divides row by row,
+    so the pre- and post-shift routing frames it stores recover psi exactly.
+    Returns None when those frames are missing.
+    """
+    for base_path in sorted((run_dir / "intermediate").glob("*/routing_df.parquet")):
+        shifted_path = base_path.with_name("post_mssr_routing_df.parquet")
+        if not shifted_path.exists():
+            continue
+        base = pd.read_parquet(base_path, columns=["travel_time_min"])
+        shifted = pd.read_parquet(shifted_path, columns=["travel_time_min"])
+        if not base.index.equals(shifted.index):
+            continue
+        ratio = base["travel_time_min"] / shifted["travel_time_min"]
+        psi = float(ratio.median())
+        if ratio.std() > 1e-6:
+            # A non-uniform shift leaves INRIX edges alone, so the per-trip
+            # ratio varies and the median is only an estimate of the mean shift.
+            logger.warning("Speed shift is not uniform (psi spread %.3g); using "
+                           "the median %.4f", ratio.std(), psi)
+        return psi
+    return None
+
+
+def routed_edge_loads(run_dir: Path, load_hours: str = "traversal",
+                      apply_speed_shift: bool = True
                       ) -> tuple[gpd.GeoDataFrame, datetime.date]:
     """Re-route the run's calibrated trips, counting trips per road edge.
 
     load_hours="traversal" files each edge under the hour the trip is actually
     on it; "departure" files a whole trip under the hour it left, which is the
     router's own bucketing and is kept so that variant can be reproduced.
+
+    hourly_graphs.json holds the *pre*-speed-shift graphs, but the trips being
+    re-routed carry post-shift travel times, so routing on it as-is puts every
+    trip on the road for 1/psi too short a time and files traversal hours too
+    early. The shift is re-applied here unless apply_speed_shift is off.
     """
     hourly_graphs = load_hourly_graphs(run_dir)
     trips, day = load_calibrated_trips(run_dir)
+    if apply_speed_shift:
+        psi = speed_shift_ratio(run_dir)
+        if psi is None:
+            logger.warning("Could not recover the run's speed shift; routing on "
+                           "the unshifted graphs (traversal hours will be early)")
+        else:
+            logger.info("Applying the run's mean speed shift psi=%.6f before "
+                        "routing (travel times scale by %.4f)", psi, 1 / psi)
+            hourly_graphs = apply_mssr_to_existing_graphs(hourly_graphs, psi)
     _, edge_loads = get_routed(
         od_df=trips, desired_date=day, hourly_graphs_arg=hourly_graphs,
         post_calibration=True, return_edge_loads=True,
@@ -462,7 +506,7 @@ def _write_summary(path: Path, context: dict, results: dict, deciles: dict) -> N
         "Synthetic per-edge loads come from re-routing the calibrated trips; the "
         "run itself was built from OSM default speeds, so INRIX is an "
         f"independent observation here. Loads are bucketed by **{context['load_hours']} "
-        "hour**.",
+        f"hour** and the run's mean speed shift is **{context['speed_shift']}**.",
         "",
         "| window | hour | n segments | match rate | Spearman rho (mean load) | p "
         "| n buffer-matched | share nearest-fallback | rho buffer-only | p |",
@@ -534,6 +578,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tmas-sta", default=None,
                         help="TMAS station file; enables the count-station comparison")
     parser.add_argument("--tmas-vol", default=None, help="TMAS monthly volume file")
+    parser.add_argument("--no-speed-shift", action="store_true",
+                        help="Route on hourly_graphs.json as stored, without "
+                             "re-applying the run's mean speed shift")
+    parser.add_argument("--station-bearing-tol", type=float, default=45.0,
+                        help="Bearing tolerance in degrees for matching a TMAS "
+                             "station-direction to a road edge (default 45)")
     parser.add_argument("--out-dir", default=None,
                         help="Where to write the outputs (default <run_dir>/validation); "
                              "point variants elsewhere so they do not clobber each other")
@@ -551,7 +601,8 @@ def main() -> None:
     out_dir = Path(args.out_dir) if args.out_dir else run_dir / "validation"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    edges_all, day = routed_edge_loads(run_dir, args.load_hours)
+    edges_all, day = routed_edge_loads(run_dir, args.load_hours,
+                                       apply_speed_shift=not args.no_speed_shift)
     edges_all.to_parquet(out_dir / "edge_loads.parquet")
 
     inrix_day = (datetime.date.fromisoformat(args.inrix_day)
@@ -563,6 +614,7 @@ def main() -> None:
     context = {
         "state": args.state, "county": args.county, "run_id": run_dir.name,
         "day": str(day), "inrix_day": str(inrix_day), "load_hours": args.load_hours,
+        "speed_shift": "off" if args.no_speed_shift else "on",
         "code_sha": code_sha(), "hours": hours,
     }
     results, deciles, rows = {}, {}, []
@@ -591,7 +643,7 @@ def main() -> None:
         station_counts.run(
             edges_all=edges_all, day=day, out_dir=out_dir,
             sta_path=Path(args.tmas_sta), vol_path=Path(args.tmas_vol),
-            county_code=args.county_code,
+            county_code=args.county_code, bearing_tol_deg=args.station_bearing_tol,
             context={k: v for k, v in context.items() if k != "hours"},
         )
     logger.info("Wrote validation outputs to %s", out_dir)

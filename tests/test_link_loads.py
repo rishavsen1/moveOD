@@ -329,6 +329,21 @@ def _two_class_frame():
     })
 
 
+def test_speed_shift_is_recovered_from_the_stored_routing_frames(tmp_path):
+    """rescale_routing_df divides row by row, so the two frames recover psi."""
+    day_dir = tmp_path / "intermediate" / "2025-03-17"
+    day_dir.mkdir(parents=True)
+    base = pd.DataFrame({"travel_time_min": [10.0, 20.0, 35.0]})
+    base.to_parquet(day_dir / "routing_df.parquet")
+    (base / 0.7426).to_parquet(day_dir / "post_mssr_routing_df.parquet")
+    assert link_loads.speed_shift_ratio(tmp_path) == pytest.approx(0.7426)
+
+
+def test_speed_shift_is_none_when_the_run_stored_no_routing_frames(tmp_path):
+    (tmp_path / "intermediate").mkdir()
+    assert link_loads.speed_shift_ratio(tmp_path) is None
+
+
 def test_stratified_spearman_reports_each_class():
     out = link_loads.stratified_spearman(
         _two_class_frame(), "load_mean", "congestion", "frc"
