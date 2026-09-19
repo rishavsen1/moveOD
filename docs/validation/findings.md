@@ -14,6 +14,8 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
 | Mean travel time per departure block | ACS B08133 / B08302 | 9 of 87 tracts + county | pooled bias only; cell-level R² uninformative |
 | Link loads vs observed speed drop | INRIX, 2025-03-10 and 03-17 | 6,105 XD segments | null; under-powered (3 % mean speed drop at 07:00) |
 | Link loads vs hourly station counts | FHWA TMAS, 10–11 station-directions | per site, per hour | informative: correct AM shape, site-level loading errors |
+| Tract-to-tract flows | CTPP 2017-2021 Part 3 (survey, independent of LODES) | tract pairs | flows inherited from LODES; CPC 0.67 for both |
+| Departure and travel time **per flow** | CTPP b302104 / b302106 | 786 intra-county flows | fails at ~10x the sampling-noise floor |
 
 ## Statements that hold
 
@@ -48,6 +50,19 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
    ACS includes out-of-county and non-auto commuters, which lengthens the ACS side, so the
    confound is conservative.
 
+8. **Spatial flows are LODES's, and CTPP scores both at 0.67.** Against CTPP's independent
+   survey-based tract-to-tract flows, the common part of commuters is 0.666 for the synthetic
+   trips and 0.666 for raw LODES, identical to four decimals on every basis tried. Coverage is
+   excellent: only 1.3 % of CTPP workers sit on flows MoveOD lacks, and the structural ceiling
+   imposed by CTPP's own suppression is 0.987. The shortfall is flow magnitude, not missing
+   pairs. Say plainly that this checks the LODES input, not the synthesis.
+9. **Per-flow timing fails, and the county aggregate hides it.** Worker-weighted per-flow TVD
+   against CTPP is 0.688 for departure time and 0.539 for travel time, against Monte Carlo
+   sampling-noise floors of 0.068 and 0.055, so roughly ten times the floor in both cases. The
+   pooled county-level TVDs for the same quantities are 0.026 and 0.098. Report the ratio to the
+   floor, never the raw TVD alone. CTPP travel times are self-reported and heaped on multiples of
+   five, a confound the departure result does not carry.
+
 ## Modelling limitations the station comparison exposed
 
 - **Through traffic is outside the model.** Every calibrated trip has origin and destination in
@@ -64,6 +79,13 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
   tiered selection keeps the tagged-OSM set however small instead of falling back to Microsoft
   footprints. This is the concentration failure the paper's introduction argues against; a
   minimum-candidate threshold before falling back would remove it.
+- **No per-destination timing structure.** The integer program constrains each origin's
+  departure marginal and has nothing that distinguishes one destination from another, so it
+  spreads a single origin profile across every destination that origin serves. Synthetic flows
+  occupy a median 4.63 effective departure bins against CTPP's 2.81, and 2.73 against 2.29 for
+  travel time: the synthetic profiles are too smooth and too alike, while real workplaces have
+  lumpy shift structure. A workplace-side constraint is the obvious extension, though ACS
+  publishes B08602 only at county level, so CTPP Part 2 or Advan would have to supply it.
 - **TMAS data contradiction at 000540.** The station file signs N/S, the volume file E/W; the E/W
   cone reaches only residential cross streets (ratios 0.008 and 0.002). Drop both rows from any
   headline figure: pooled AM ratio without them is 0.499 (n 8).

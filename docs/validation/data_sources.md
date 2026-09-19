@@ -13,9 +13,17 @@ SR-21; 26 station-direction rows that day. The pooled hourly profile peaks at 7�
 
 ## Not yet acquired
 
-- **CTPP 2017-2021 Part 3** tract-to-tract flows (A302100 workers; A302103 by means of transportation)
-  for Tennessee: the portal at https://ctppdata.transportation.org is interactive. Steps: Part 3 →
-  select table → Geography → *Bulk Selection* tab → Tract-to-Tract, State = Tennessee → Retrieve →
-  Download CSV. Save to `data/ctpp/`.
+- ~~CTPP portal download~~ — **superseded**: CTPP is fetched through its data API by
+  `analysis/ctpp.py` using `CTPP_API_KEY` from `.env`. `POST https://ctppdata.transportation.org/api/data/2021`
+  with `{"geo": "C1100US<state><county>", "get": "<table>_e1,...", "d-geo": "C3100US"}`. There is no
+  metadata endpoint; the table inventory and column counts in `docs/EXPERIMENTS.md` were probed.
+  Cached to `data/ctpp/<table>_<county>_tract_<year>.parquet`.
 - MPO HBW trip tables, TDOT hourly counts, Advan Neighborhood Patterns: request drafts in
   `data_requests.md`.
+- **Google Routes API**: `GOOGLE_MAPS_API_KEY` is in `.env` and the key is valid, but the Cloud
+  project has no billing account, so every call returns 403 `BILLING_DISABLED`. Google requires a
+  billing account even inside the free monthly caps (10,000 route-matrix elements, 5,000
+  traffic-aware). Blocked pending that.
+- **Replica trip summary** (`data/ReplicaTripSummaries.xlsx`): region-wide marginals only, no OD
+  structure, and **no region, season or year label anywhere in the file**. Unusable until the
+  export is identified. Replica is itself a synthetic model, so it is face validity, not truth.
