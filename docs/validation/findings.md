@@ -16,6 +16,7 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
 | Link loads vs hourly station counts | FHWA TMAS, 10–11 station-directions | per site, per hour | informative: correct AM shape, site-level loading errors |
 | Tract-to-tract flows | CTPP 2017-2021 Part 3 (survey, independent of LODES) | tract pairs | flows inherited from LODES; CPC 0.67 for both |
 | Departure and travel time **per flow** | CTPP b302104 / b302106 | 786 intra-county flows | fails at ~10x the sampling-noise floor |
+| Flows vs a second independent source | Replica activity model, Oct 2024 | tract pairs | MoveOD sits inside the source-disagreement envelope |
 
 ## Statements that hold
 
@@ -63,6 +64,18 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
    floor, never the raw TVD alone. CTPP travel times are self-reported and heaped on multiples of
    five, a confound the departure result does not carry.
 
+10. **The flow score has a benchmark now, and it is favourable.** Four commute matrices exist for
+   Hamilton: MoveOD, LODES, CTPP and Replica. On the flows all three non-LODES sources publish,
+   MoveOD agrees with CTPP at Sørensen 0.671 and with Replica at 0.654, while **CTPP and Replica
+   agree with each other at only 0.605**. The same ordering holds on every support and on rank
+   correlation. So a score near 0.65, which looks weak in isolation, is inside the envelope of
+   disagreement between two established measurements of the same county. State the benchmark
+   whenever the flow score is quoted; the score alone is not interpretable.
+   Caveat that must travel with it: MoveOD's tract flows are identical to LODES's, so this shows
+   the **input** sits inside that envelope, not that the synthesis is good. Replica's work trips
+   include those not starting at home, CTPP suppresses flows under three observations, and the
+   three vintages differ (CTPP 2017-2021, Replica October 2024, MoveOD March 2025).
+
 ## Modelling limitations the station comparison exposed
 
 - **Through traffic is outside the model.** Every calibrated trip has origin and destination in
@@ -107,7 +120,8 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
    `data_sources.md`). It is the only public external test with spatial content, and the one a
    reviewer will ask for. Compare LODES vs CTPP and synthetic vs CTPP separately so input error and
    synthesis error are not conflated.
-3. When Advan Neighborhood Patterns arrive, use `work_behavior_device_home_areas` for a
+3. Replica supplies no time-of-day dimension in its origin-destination export, so it cannot test
+   the per-flow timing failure. When Advan Neighborhood Patterns arrive, use `work_behavior_device_home_areas` for a
    block-group home → work matrix and `stops_by_each_hour` for per-workplace-BG arrival profiles —
    the block-group resolution that ACS does not provide.
 4. Plumb a `--seed` through `generate/calibrate_ilp.py` (seeds are hard-coded: 123, 42 and a

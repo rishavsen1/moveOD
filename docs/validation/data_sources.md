@@ -24,6 +24,13 @@ SR-21; 26 station-direction rows that day. The pooled hourly profile peaks at 7â
   project has no billing account, so every call returns 403 `BILLING_DISABLED`. Google requires a
   billing account even inside the free monthly caps (10,000 route-matrix elements, 5,000
   traffic-aware). Blocked pending that.
-- **Replica trip summary** (`data/ReplicaTripSummaries.xlsx`): region-wide marginals only, no OD
-  structure, and **no region, season or year label anywhere in the file**. Unusable until the
-  export is identified. Replica is itself a synthetic model, so it is face validity, not truth.
+- **Replica origin-destination export** (`data/replica/replica-10_08_24-origin-destination.csv`,
+  61 MB, git-ignored): 601,872 zone pairs over 7,719 custom zones covering the Chattanooga region,
+  with trip counts split by purpose including `work_count`. Centroids only, no polygons, so zones
+  are assigned to the block group containing their centroid. No time-of-day dimension. Wired up in
+  `analysis/replica.py`. Replica is itself a model, so this is agreement between models and
+  measurements, not validation against truth.
+- `data/replica/ReplicaTripSummaries.xlsx`: region-wide marginals, no OD structure, and no region,
+  season or year label anywhere in the file. Superseded by the export above; unused.
+- `data/replica/Hamilton County_Replica_ForCARTA.mpkx`: 91 MB ArcGIS mobile map package. Unused;
+  it would supply the zone polygons if centroid assignment ever needs replacing.
