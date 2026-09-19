@@ -770,6 +770,31 @@ def post_calibrating_assignment(calibrated_trips, origin_buildings, dest_buildin
     return synthetic_df
 
 
+def _ctpp_anchored_w_dict(w_dict, cand, od_df, lodes_dict, split_seed=None):
+    """Rebuild the ILP anchor from CTPP per-flow departure profiles (opt-in).
+
+    See generate/ctpp_anchor.py; imported lazily because it reaches
+    analysis.ctpp, which pulls in matplotlib, scipy and requests.
+    """
+    from generate.ctpp_anchor import (
+        apply_ctpp_anchor,
+        load_ctpp_departure_shares,
+        select_anchor_pairs,
+    )
+
+    geoid = str(od_df["h_geocode"].iloc[0])
+    shares = load_ctpp_departure_shares(geoid[:2], geoid[2:5])
+    if split_seed is not None:
+        keep = select_anchor_pairs(shares.keys(), split_seed)
+        print(f"CTPP anchor split-half (seed {split_seed}): "
+              f"building from {len(keep)} of {len(shares)} published tract pairs")
+        shares = {pair: profile for pair, profile in shares.items() if pair in keep}
+
+    anchored, stats = apply_ctpp_anchor(w_dict, cand, shares, lodes_dict)
+    print(f"CTPP anchor: {stats}")
+    return anchored
+
+
 def calibrate_with_ilp(
     od_df,
     routing_df,
@@ -781,6 +806,8 @@ def calibrate_with_ilp(
     desired_date=None,
     alpha=1.0,
     beta=1.0,
+    ctpp_anchor=False,
+    ctpp_anchor_split_seed=None,
 ):
 
     dep_tbl = census_depart_times_df.set_index("GEO_ID")
@@ -812,6 +839,11 @@ def calibrate_with_ilp(
     w_dict = get_initial_od_dist(od_df)
 
     cand_with_bins = get_all_candidates(od_df, dep_pos, routing_df, tt_bin_names)
+
+    if ctpp_anchor:
+        w_dict = _ctpp_anchored_w_dict(
+            w_dict, cand_with_bins, od_df, lodes_dict, ctpp_anchor_split_seed
+        )
 
     # Run calibration with strict OD and time distribution
     calibrated_trips = calibrate_with_strict_od_time_ilp(

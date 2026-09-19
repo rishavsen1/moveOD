@@ -381,6 +381,21 @@ def build_parser():
              "(the paper's beta; default 1.0). Use 0 to drop the anchor term.",
     )
     parser.add_argument(
+        "--ctpp-anchor",
+        action="store_true",
+        default=False,
+        help="Anchor the ILP's initial OD distribution on CTPP B302104 per-flow "
+             "departure profiles instead of the origin-only random assignment "
+             "(default: off, which leaves the run byte-identical)",
+    )
+    parser.add_argument(
+        "--ctpp-anchor-split-seed",
+        type=int,
+        default=None,
+        help="With --ctpp-anchor, build the anchor from a seeded random half of "
+             "the published tract pairs only, so the other half stays held out",
+    )
+    parser.add_argument(
         "--interactive",
         "-i",
         action="store_true",
@@ -406,6 +421,8 @@ def run_pipeline(
     inrix_conversion_path,
     alpha=1.0,
     beta=1.0,
+    ctpp_anchor=False,
+    ctpp_anchor_split_seed=None,
 ):
     """Core pipeline — equivalent to pressing BEGIN in the Streamlit app."""
 
@@ -737,6 +754,8 @@ def run_pipeline(
             desired_date=day,
             alpha=alpha,
             beta=beta,
+            ctpp_anchor=ctpp_anchor,
+            ctpp_anchor_split_seed=ctpp_anchor_split_seed,
         )
         
         # Free post-MSSR routing data and adjusted graphs after calibration
@@ -881,6 +900,8 @@ def main():
         inrix_conversion_path=inrix_conversion_path,
         alpha=args.alpha,
         beta=args.beta,
+        ctpp_anchor=args.ctpp_anchor,
+        ctpp_anchor_split_seed=args.ctpp_anchor_split_seed,
     )
 
 
