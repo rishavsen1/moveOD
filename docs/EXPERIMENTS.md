@@ -50,3 +50,36 @@ Every measured number quoted in docs, the paper, or commit messages has a row he
 | 2026-09-19 | a39b64a | same, restricted supports (robustness) | same | benchmark robustness | restricted to the 3,003 flows CTPP publishes: MoveOD-CTPP SSI 0.664, MoveOD-Replica 0.650, CTPP-Replica 0.599. Restricted to the 2,798 flows in all three: 0.671, 0.654, **0.605**; Spearman 0.516, 0.654, **0.444** | CTPP-Replica is the weakest pair on every support and both statistics, so the pattern is not an artifact of CTPP's ≥3-observation suppression. Caveat: MoveOD's tract flows are LODES's, so this shows LODES sits inside the envelope and the synthesis does not degrade it |
 | 2026-09-19 | a39b64a | `GET maps.googleapis.com/maps/api/distancematrix/json` and `POST routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix`, with and without `TRAFFIC_AWARE` | Google Maps Platform, key ending GJ6M | key status, retest | legacy: `REQUEST_DENIED`, legacy API not enabled for the project; Routes API both variants: HTTP 403 `BILLING_DISABLED` on project 900487742198 | not a transient state and not caused by the traffic-aware SKU. Google requires a billing account on the project even for the free monthly caps; no call succeeds until one is attached |
 | 2026-09-19 | 4e69c36 | inline: share of synthetic trips on CTPP-published tract pairs, and Monte Carlo TVD if each covered flow adopted the CTPP profile (50 replicates, seed 3) | Hamilton 2025-03-17, 786 qualifying flows | expected gain from a CTPP-anchored calibration | 78.7 % of trips lie on published tract pairs; covered flows would reach the 0.068 sampling floor, giving a weighted per-flow TVD of ≈0.20 against today's 0.688, about **3.4x better** | upper bound only: constraints (2)–(4) pull away from the anchor, CTPP is rounded to 5 (≈6 % quantisation on a median 80-worker flow) and perturbed, and tract-level profiles are applied to block-group pairs |
+
+## Correction, 2026-09-19: the archived Hamilton run is stale
+
+Every row above measured against `move_OD/Tennessee/Hamilton/2025-03-17_2025-03-17` describes a run
+whose calibration behaved as if `beta = 0`, i.e. with the anchor term inert. Evidence: commit
+`7dc7937` ("Fix get_initial_od_dist: quadratic blowup and an inert beta term") landed 2026-09-17
+23:09; the archived CSV was written 23:15, but the running pipeline had already imported the
+pre-fix module. `generate/calibrate_ilp.py` has not changed since that commit. The fingerprint is
+decisive: the archived run has a median of 116 non-zero `(destination, departure-bin)` cells per
+origin against a transportation-polytope vertex bound of 112, with 23 % of origins at or below the
+bound (a sparse unpenalised LP vertex); a fresh run at HEAD has 291, and `--beta 0` at HEAD
+reproduces the archived CTPP numbers to six decimals.
+
+What this does and does not change, verified against fresh runs:
+
+| quantity | archived (beta=0) | fresh at HEAD | verdict |
+|---|---|---|---|
+| per-flow departure TVD vs CTPP | 0.688 (10.1x floor) | **0.624 (9.19x floor)** | finding survives |
+| per-flow travel-time TVD vs CTPP | 0.539 (9.8x) | **0.554 (10.0x)** | finding survives |
+| effective departure bins per flow | 4.63 | **9.01** (CTPP 2.81) | the "too smooth" mechanism is *stronger* at HEAD |
+| flow agreement vs CTPP / Replica | 0.585 / 0.626 SSI | **identical to 4 dp** | source benchmark unaffected |
+| TMAS AM profile-shape r | 0.406 | **0.315** | corrected |
+| TMAS AM ratio, r(log1p) | 0.459, 0.745 | **0.460, 0.735** | essentially unchanged |
+| trips | 158,253 | 158,253 | unchanged |
+
+**Consequence:** Hamilton must be regenerated at HEAD before any of these numbers go in a paper,
+along with the other counties. The conclusions all survive; several numbers move.
+
+| date | code | command | data/seed | metric | value | note |
+|---|---|---|---|---|---|---|
+| 2026-09-19 | 9c9b79f | `cli.py --state Tennessee --county Hamilton --start-date 2025-03-17 --end-date 2025-03-17 --lodes-year 2022 --tiger-year 2024` from an isolated root | Hamilton 2025-03-17, fresh at HEAD, seed 42 | baseline at current code | 158,253 trips; per-flow departure TVD 0.6240 (9.19x floor), travel time 0.5538 (10.0x); eff. bins 9.01 vs CTPP 2.81; TMAS AM profile r 0.3147, ratio 0.4602, r(log1p) 0.7351; county departure TVD vs B08302 0.0006 | supersedes the archived run for every Hamilton number |
+| 2026-09-19 | 9c9b79f+dirty | same plus `--ctpp-anchor` | same | **CTPP-anchored calibration** | per-flow departure TVD **0.2326** (3.43x floor), eff. bins 4.09; travel time 0.5524 (unchanged, held out); county departure TVD vs B08302 0.0006 (hard constraint intact); flow agreement vs CTPP and Replica identical to 4 dp (O-D marginal guard held); **TMAS AM profile-shape r 0.3147 → 0.4462** with volume ratio 0.460 → 0.458 and r(log1p) 0.735 → 0.746 | in-sample gain 2.68x. The independent observed-traffic test improves substantially at constant volume: same vehicles, better hour placement. 93.7 % of CTPP mass retained after restricting to available cells; 10,290 of 27,382 flows fell back (unpublished tract pair), 792 zero-mass, 0 missing candidates. Calibration 22 s → 44 s |
+| 2026-09-19 | 9c9b79f+dirty | same plus `--ctpp-anchor --ctpp-anchor-split-seed 11` | anchor built from a seeded random half of published tract pairs | **split-half, the honest generalisation test** | anchored half 0.2275; **held-out half 0.6230 against a baseline 0.6206** | **no transfer.** The anchor is a lookup table, not a learned model: it fixes flows CTPP publishes and does nothing for the rest. Since publication is known at build time, the deployment number is the full-data 0.2326 covering 78.7 % of trips, but the paper must state the held-out result too |
