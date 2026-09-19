@@ -58,9 +58,11 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
    imposed by CTPP's own suppression is 0.987. The shortfall is flow magnitude, not missing
    pairs. Say plainly that this checks the LODES input, not the synthesis.
 9. **Per-flow timing fails, and the county aggregate hides it.** Worker-weighted per-flow TVD
-   against CTPP is 0.688 for departure time and 0.539 for travel time, against Monte Carlo
-   sampling-noise floors of 0.068 and 0.055, so roughly ten times the floor in both cases. The
-   pooled county-level TVDs for the same quantities are 0.026 and 0.098. Report the ratio to the
+   against CTPP is 0.624 for departure time and 0.554 for travel time, against Monte Carlo
+   sampling-noise floors of 0.068 and 0.055, so nine to ten times the floor. The pooled
+   county-level TVDs for the same quantities are 0.032 and 0.161. The opt-in `--ctpp-anchor`
+   calibration cuts the departure figure to 0.233 and lifts the independent traffic-sensor profile
+   correlation from 0.315 to 0.446, but does not transfer to flows CTPP does not publish. Report the ratio to the
    floor, never the raw TVD alone. CTPP travel times are self-reported and heaped on multiples of
    five, a confound the departure result does not carry.
 
@@ -113,7 +115,8 @@ Status as of 2026-09-18, branch `feat/external-validation`. Every number below h
 
 ## Before any of this goes into the paper
 
-1. Regenerate every county under `move_OD/` with current code; 24 of 48 run-days lack an
+1. Regenerate every county under `move_OD/` with current code, **including Hamilton**, whose
+   archived run was found on 2026-09-19 to predate the anchor fix; 24 of 48 run-days lack an
    uncalibrated frame and several are pre-fix outputs (departures all in bin 0; Davidson with
    90.8 % of travel times imputed at 11.02 min; Madison with 41,201 of 168,927 workers).
 2. Acquire CTPP 2017-2021 tract-to-tract flows for Tennessee (portal steps in

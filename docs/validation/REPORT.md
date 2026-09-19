@@ -5,6 +5,10 @@ origin-destination pairs. Six independent tests, all reproducible, all numbers i
 `docs/EXPERIMENTS.md`. Demonstrated on Hamilton County, TN (158,253 synthetic commute trips,
 2025-03-17).
 
+> **Numbers updated 2026-09-19.** The run these figures were first measured on turned out to
+> predate a calibration fix. Every conclusion survives; some figures moved. See the correction at
+> the end of `docs/EXPERIMENTS.md`. Regenerate all county outputs before publishing.
+
 ---
 
 ## Why the old claim was not enough
@@ -62,14 +66,20 @@ travel times. Nothing in MoveOD is fitted to this.
 
 | | MoveOD's error | Error a *perfect* model would still make | Ratio |
 |---|---|---|---|
-| Departure time, per flow | 0.688 | 0.068 | **10×** |
-| Travel time, per flow | 0.539 | 0.055 | **10×** |
+| Departure time, per flow | 0.624 | 0.068 | **9×** |
+| Travel time, per flow | 0.554 | 0.055 | **10×** |
 
 The second column is a sampling-noise floor, measured by simulation: with ~58 trips spread over 14
 time bins, even a flawless model scores above zero. MoveOD is ten times worse than that.
 
-Meanwhile the **county-wide** distributions are fine (0.026 and 0.098). The model gets the whole
+Meanwhile the **county-wide** distributions are fine (0.032 and 0.161). The model gets the whole
 right and the parts wrong. Section "Why" below explains the cause.
+
+**A fix exists and is implemented** (`--ctpp-anchor`, off by default). Feeding CTPP's observed
+per-flow departure profiles into the calibration cuts the error from 0.624 to 0.233, and raises the
+morning profile correlation at traffic sensors from 0.315 to 0.446 with total volume unchanged.
+It does not generalise to flows CTPP does not publish, so it imports the timing rather than
+learning it. See `ctpp_joint_proposal.md`.
 
 ### 4. Held-out Census tables — *inconclusive, by construction*
 
@@ -115,7 +125,7 @@ times are drawn at random within each origin block group without reference to de
 
 So every destination served by one origin inherits the same departure profile. Reality is lumpier:
 a hospital, a school and an office draw from the same neighbourhood at different hours. The data
-show it — synthetic flows spread over 4.6 effective departure bins where CTPP uses 2.8.
+show it — synthetic flows spread over 9.0 effective departure bins where CTPP uses 2.8.
 
 CTPP is the first dataset able to test that stated assumption, and the assumption does not hold.
 Fixing it needs a workplace-side timing constraint, which ACS does not publish below county level.
@@ -127,6 +137,7 @@ Fixing it needs a workplace-side timing constraint, which ACS does not publish b
 | Test | Verdict |
 |---|---|
 | Hourly traffic counts | **Passes** — correct commute shape, 0.7 of observed morning peak |
+| Per-flow timing after the CTPP fix | Improves 2.7x in sample, confirmed by traffic sensors; no transfer to unpublished flows |
 | Flows vs CTPP and Replica | **Passes** — inside the range over which real sources disagree |
 | Per-flow timing | **Fails** — 10× the noise floor, while the county total is right |
 | Held-out Census tables | Inconclusive — county level is too coarse |
