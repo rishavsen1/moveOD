@@ -1208,10 +1208,13 @@ def plot_cross_county_tvd(metrics: pd.DataFrame, out_path: Path) -> None:
 def run_all_counties(output_root: Path, seed: int, skip_baselines: bool, acs_year: int = ACS_YEAR) -> pd.DataFrame:
     """Validate every run under the output root, never crashing on a bad run."""
     collected: list[pd.DataFrame] = []
+    skipped: list[str] = []
     for run_dir, csv_path, state, county in discover_runs(output_root):
-        metrics = _validate_or_log(run_dir, csv_path, state, county, seed, skip_baselines, acs_year)
+        metrics = _validate_or_log(run_dir, csv_path, state, county, seed, skip_baselines, acs_year, skipped)
         if metrics is not None:
             collected.append(metrics)
+    if skipped:
+        LOGGER.error("%d run-day(s) skipped; the summary covers the rest only: %s", len(skipped), ", ".join(skipped))
     if not collected:
         LOGGER.warning("No runs validated under %s", output_root)
         return pd.DataFrame()
@@ -1222,17 +1225,22 @@ def run_all_counties(output_root: Path, seed: int, skip_baselines: bool, acs_yea
     metrics.to_csv(summary_dir / "cross_county_metrics.csv", index=False)
     plot_cross_county_tvd(metrics, summary_dir / "cross_county_tvd.png")
     LOGGER.info("Wrote %s", summary_dir / "cross_county_metrics.csv")
+    metrics.attrs["skipped"] = skipped
     return metrics
 
 
 def _validate_or_log(run_dir: Path, csv_path: Path, state: str, county: str, seed: int,
-                     skip_baselines: bool, acs_year: int) -> pd.DataFrame | None:
-    """Validate one day, logging and swallowing anything that run alone breaks on."""
+                     skip_baselines: bool, acs_year: int, skipped: list[str] | None = None) -> pd.DataFrame | None:
+    """Validate one day, logging and swallowing anything that run alone breaks on.
+
+    A skipped day's label is appended to `skipped` so the caller can fail the run."""
     label = f"{state}/{county}/{run_dir.name}/{csv_path.stem}"
     try:
         metrics = validate_run(run_dir, csv_path, state, county, seed, skip_baselines, acs_year)
     except Exception as exc:  # one bad day must not stop the others
         LOGGER.warning("SKIP %s: %s: %s", label, type(exc).__name__, exc)
+        if skipped is not None:
+            skipped.append(label)
         return None
     LOGGER.info("OK   %s", label)
     return metrics
@@ -1253,18 +1261,20 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     output_root = Path(args.output_root)
     if args.all_counties:
-        run_all_counties(output_root, args.seed, args.skip_baselines, args.acs_year)
-        return
+        metrics = run_all_counties(output_root, args.seed, args.skip_baselines, args.acs_year)
+        sys.exit(1 if metrics.empty or metrics.attrs.get("skipped") else 0)
 
     run_dir = find_run_dir(output_root, args.state, args.county, args.run_id)
+    skipped: list[str] = []
     for csv_path in calibrated_csvs(run_dir) or [find_calibrated_csv(run_dir)]:
         metrics = _validate_or_log(run_dir, csv_path, args.state, args.county, args.seed,
-                                   args.skip_baselines, args.acs_year)
+                                   args.skip_baselines, args.acs_year, skipped)
         if metrics is None:
             continue
         print((run_dir / "validation" / csv_path.stem / "summary.md").read_text())
         LOGGER.info("Wrote %d metric rows to %s", len(metrics),
                     run_dir / "validation" / csv_path.stem / "metrics.csv")
+    sys.exit(1 if skipped else 0)
 
 
 if __name__ == "__main__":

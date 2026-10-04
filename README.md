@@ -124,6 +124,14 @@ The notebook in `analysis/figures_1_2.ipynb` shows the same workflow for Figures
 
 Because road speeds may be sampled and INRIX is optional, reruns are expected to be qualitatively similar rather than byte-for-byte identical.
 
+## External validation
+
+`analysis/validate_external.py`, `ctpp.py`, `replica.py`, `link_loads.py` and `station_counts.py`
+score the output against data the pipeline never reads (ACS held-out tables, CTPP, Replica, TMAS
+counts, INRIX). Results, caveats and commands: `docs/validation/REPORT.md` and `docs/EXPERIMENTS.md`.
+Opt-in: `--ctpp-anchor` anchors calibration on CTPP per-flow departure profiles (needs `CTPP_API_KEY`).
+Run tests with `uv run pytest tests`.
+
 <p align="center">
   <img src="files/moveod_plots.png" alt="MoveOD plots" width="800" />
 </p>
