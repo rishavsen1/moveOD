@@ -110,3 +110,8 @@ CLAUDE.md
 
 # Rendered brag video, its Hyperframes projects and inlined datasets
 brag-output/
+
+# Local logs and test cache
+*.log
+log_files/
+.pytest_cache/
