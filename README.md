@@ -50,12 +50,6 @@ MoveOD is a transportation data generation pipeline that combines public spatial
 pip install -r requirements.txt
 ```
 
-If you want to use the backend web app, install its extra dependencies too:
-
-```bash
-pip install -r backend/requirements.txt
-```
-
 Optional: if you have IBM CPLEX installed, set its path before running the pipeline to speed up ILP calibration.
 
 ```bash
